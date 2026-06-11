@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# agents -- launch the Textual "agents tui" dashboard over ~20 Claude Code
+# tmux sessions. Replaces the fzf cockpit (preserved as `agents-classic`).
+#
+# Runs entirely inside the isolated venv in this dir (only dep: textual).
+# tmux owns the truth (sessions, identity stamps, attention tint, aerospace
+# wid); /tmp/claude-ctx supplies ctx%; ~/.claude/projects/*.jsonl transcripts
+# supply the last message + age. Enter jumps to the Ghostty window via
+# Aerospace (@aerospace_wid).
+#
+# The previous fzf picker still lives next to this file as `agents-classic`
+# (and is symlinked at ~/.local/bin/agents-classic).
+
+set -euo pipefail
+
+HERE="/Users/kiran/Desktop/forge.nosync/agents-cockpit"
+VENV_PY="${HERE}/.venv/bin/python"
+
+if [ ! -x "$VENV_PY" ]; then
+  echo "agents: venv python not found at $VENV_PY" >&2
+  echo "  recreate it: /opt/homebrew/bin/python3 -m venv ${HERE}/.venv && ${HERE}/.venv/bin/pip install -r ${HERE}/requirements.txt" >&2
+  exit 1
+fi
+
+# Run from this dir so `python -m agents_tui` resolves the package regardless
+# of the caller's cwd (PYTHONPATH also set as a belt-and-braces fallback).
+export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"
+cd "$HERE"
+exec "$VENV_PY" -m agents_tui "$@"

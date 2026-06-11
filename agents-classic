@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# agents -- fzf cockpit for ~20 Claude Code tmux sessions.
+#
+# Reads live state from tmux (it owns the truth) and lets you JUMP to the
+# Ghostty window hosting a session via Aerospace. The read/jump split:
+#   - tmux  : session list, identity stamps (@cc_name/@cc_color), attention
+#             tint (window-active-style bg=colour52), the aerospace wid stamp.
+#   - ctx   : /tmp/claude-ctx/<sid>.json (written ~2s by statusline.sh) -> ctx%.
+#   - aerospace : @aerospace_wid pane-option -> focus the right Ghostty window.
+#
+# Modes:
+#   agents            interactive fzf picker (Enter = jump to window)
+#   agents --list     (alias --once) print rendered rows once, no fzf (test/pipe)
+#   agents --rows     internal: same as --list, used by the fzf reload loop
+#
+# See README.md in this dir for the full design.
+
+set -uo pipefail
+
+CTX_DIR="/tmp/claude-ctx"
+NEEDY_STYLE="bg=colour52"   # set by ~/.claude/hooks/tmux-attention.sh
+VALID_COLORS="red blue green yellow purple orange pink cyan"
+
+# name -> 256-color code for the identity dot (grey = unstamped fallback).
+color_code() {
+  case "$1" in
+    red)    echo 196 ;;
+    blue)   echo 39  ;;
+    green)  echo 46  ;;
+    yellow) echo 226 ;;
+    purple) echo 129 ;;
+    orange) echo 208 ;;
+    pink)   echo 205 ;;
+    cyan)   echo 51  ;;
+    *)      echo 244 ;;  # grey
+  esac
+}
+
+# Prettify a raw session name when no @cc_name is stamped:
+#   strip a leading "cc-" and a trailing "-<digits>" (the launcher pid).
+#   cc-lexi-backend-34731   -> lexi-backend
+#   cc-lexi_code-nosync-79710 -> lexi_code-nosync
+#   devservers / lexi-ui / txbench (no cc- prefix) -> unchanged
+prettify() {
+  local n="$1"
+  n="${n#cc-}"
+  n="${n%-[0-9]*}"   # drop trailing -<digits> (works because [0-9]* is greedy-anchored by the trailing match)
+  echo "$n"
+}
+
+# Active pane id for a session (pane_active == 1).
+active_pane() {
+  tmux list-panes -t "$1" -F '#{pane_id} #{pane_active}' 2>/dev/null \
+    | awk '$2==1{print $1; exit}'
+}
+
+# Read a pane-option value (empty if unset). -q quiet, -v value-only.
+pane_opt() {
+  tmux show-options -p -t "$1" -qv "$2" 2>/dev/null
+}
+
+# Is the session needy? true if ANY of its panes has window-active-style bg=colour52.
+session_needy() {
+  local sess="$1" pid style
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    style=$(tmux show-options -p -t "$pid" window-active-style 2>/dev/null)
+    case "$style" in
+      *"$NEEDY_STYLE"*) return 0 ;;
+    esac
+  done < <(tmux list-panes -t "$sess" -F '#{pane_id}' 2>/dev/null)
+  return 1
+}
+
+# Build pane(%NN) -> ctx% map for FRESH ctx files (ts within 60s), via python3.
+# Emits lines: "%NN<TAB>pct". Stale/old entries omitted.
+ctx_map() {
+  python3 - "$CTX_DIR" <<'PY' 2>/dev/null
+import json, os, sys, time
+d = sys.argv[1]
+now = int(time.time())
+try:
+    files = os.listdir(d)
+except OSError:
+    sys.exit(0)
+for fn in files:
+    if not fn.endswith(".json"):
+        continue
+    if fn.startswith("monitor-state"):
+        continue
+    try:
+        with open(os.path.join(d, fn)) as f:
+            j = json.load(f)
+    except Exception:
+        continue
+    pane = j.get("pane")
+    pct = j.get("pct")
+    ts = j.get("ts", 0)
+    if not pane or pct is None:
+        continue
+    try:
+        if now - int(ts) > 60:   # stale
+            continue
+    except (TypeError, ValueError):
+        continue
+    print(f"{pane}\t{pct}")
+PY
+}
+
+# Emit one rendered row per session. Each row is:
+#   <SESSION_NAME>\t<VISIBLE_TEXT>
+# The leading tab-separated session-name key is hidden in fzf via --with-nth=2..
+# and recovered by the Enter handler. Needy sessions sort to the TOP.
+render_rows() {
+  # pane -> pct lookup (fresh only). bash 3.2 has no associative arrays, so we
+  # snapshot the "%NN<TAB>pct" lines once and grep them per pane.
+  local pct_lines; pct_lines=$(ctx_map)
+
+  # echo the pct for a given pane id, or empty.
+  pct_for() {
+    [ -n "$pct_lines" ] || return 0
+    printf '%s\n' "$pct_lines" | awk -F'\t' -v p="$1" '$1==p{print $2; exit}'
+  }
+
+  local needy_rows="" normal_rows=""
+
+  while read -r sess; do
+    [ -n "$sess" ] || continue
+    local ap; ap=$(active_pane "$sess")
+
+    # identity name
+    local name; name=$(pane_opt "$ap" @cc_name)
+    [ -n "$name" ] || name=$(prettify "$sess")
+
+    # identity color
+    local color; color=$(pane_opt "$ap" @cc_color)
+    case " $VALID_COLORS " in
+      *" $color "*) : ;;          # valid, keep
+      *) color="grey" ;;          # unset/invalid -> grey dot
+    esac
+    local ccode; ccode=$(color_code "$color")
+
+    # ctx% across all panes of this session (first fresh hit wins)
+    local pct="—" pid hit
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      hit=$(pct_for "$pid")
+      if [ -n "$hit" ]; then pct="${hit}%"; break; fi
+    done < <(tmux list-panes -t "$sess" -F '#{pane_id}' 2>/dev/null)
+
+    # attention?
+    local needy=0
+    if session_needy "$sess"; then needy=1; fi
+
+    # padded name column (24 wide)
+    local padded; padded=$(printf '%-24s' "$name")
+
+    local dot text
+    if [ "$needy" -eq 1 ]; then
+      # needy: ❗ prefix + whole row in bold red. The identity dot keeps its
+      # own hue (red 196 here) so the row still reads as a colored bullet.
+      dot=$(printf '\033[38;5;196m●\033[0m')
+      text=$(printf '\033[1;91m❗ \033[0m%s \033[1;91m%s %s\033[0m' "$dot" "$padded" "$pct")
+      needy_rows+="${sess}"$'\t'"${text}"$'\n'
+    else
+      dot=$(printf '\033[38;5;%sm●\033[0m' "$ccode")
+      text=$(printf '%s %s %s' "$dot" "$padded" "$pct")
+      normal_rows+="${sess}"$'\t'"${text}"$'\n'
+    fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | sort)
+
+  # needy first, then the rest (each group already name-sorted)
+  printf '%b' "$needy_rows"
+  printf '%b' "$normal_rows"
+}
+
+# Resolve the @aerospace_wid for a session and focus that Ghostty window.
+jump_to() {
+  local sess="$1"
+  [ -n "$sess" ] || exit 0
+  local ap wid
+  ap=$(active_pane "$sess")
+  wid=$(pane_opt "$ap" @aerospace_wid)
+  if [ -n "$wid" ]; then
+    aerospace focus --window-id "$wid" 2>/dev/null \
+      || echo "could not focus window-id $wid for $sess (window may be gone)"
+  else
+    echo "no window mapping yet for $sess — attach it once so the tmux client-attached hook stamps it"
+  fi
+  exit 0
+}
+
+main() {
+  case "${1:-}" in
+    --list|--once|--rows)
+      render_rows
+      exit 0
+      ;;
+    --jump)   # internal: agents --jump <session>
+      jump_to "${2:-}"
+      ;;
+    "")
+      : # fall through to interactive
+      ;;
+    *)
+      echo "usage: agents [--list|--once]" >&2
+      exit 2
+      ;;
+  esac
+
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf not found" >&2; exit 1
+  fi
+
+  local self; self="$(command -v agents || echo "$0")"
+
+  # Live refresh: fzf's HTTP server (--listen) lets a background poller POST a
+  # `reload(agents --rows)` every 2s, so attention changes appear within ~2s.
+  #
+  # IMPORTANT (verified vs fzf 0.70 --help): plain `--listen` REFUSES actions
+  # that execute a process (like `reload`); you must use `--listen-unsafe`. We
+  # bind it to 127.0.0.1 only and the reloaded command is a FIXED literal
+  # (`agents --rows`), never attacker-controlled input, so "unsafe" here is the
+  # documented, contained way to drive our own UI — not a real exposure.
+  local port; port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null)
+
+  if [ -n "$port" ]; then
+    (
+      # give fzf a moment to bind the listener, then reload on a 2s cadence.
+      sleep 0.6
+      while sleep 2; do
+        curl -s -XPOST "http://127.0.0.1:${port}" -d "reload(${self} --rows)" >/dev/null 2>&1 || break
+      done
+    ) &
+    local poller=$!
+    trap 'kill "$poller" 2>/dev/null' EXIT INT TERM
+
+    # `start:reload` populates the list initially via the same code path.
+    fzf --ansi \
+      --listen-unsafe="127.0.0.1:${port}" \
+      --delimiter=$'\t' --with-nth=2.. \
+      --no-sort \
+      --prompt='agents> ' \
+      --header='Enter: jump to window  |  attention refreshes ~2s' \
+      --bind "start:reload(${self} --rows)" \
+      --bind "enter:execute(${self} --jump {1})+abort" < /dev/null
+  else
+    # Fallback: no free port; static snapshot piped in (usable, not live).
+    "$self" --rows | fzf --ansi \
+      --delimiter=$'\t' --with-nth=2.. \
+      --no-sort \
+      --prompt='agents> ' \
+      --header='Enter: jump to window  |  (static; no live refresh)' \
+      --bind "enter:execute(${self} --jump {1})+abort"
+  fi
+}
+
+main "$@"

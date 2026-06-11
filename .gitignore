@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+.cc-checkpoint-*
+.DS_Store
