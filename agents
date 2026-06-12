@@ -22,6 +22,17 @@ if [ ! -x "$VENV_PY" ]; then
   exit 1
 fi
 
+# Give THIS Ghostty window a stable, unique title so AeroSpace can single it
+# out (Textual never emits an OS window-title escape, so we do it here via
+# OSC-2). Then put the cockpit on its own workspace D: the on-window-detected
+# rule catches a freshly-spawned cockpit window, and for the common in-place
+# launch we also move THIS window to D and follow it there. All best-effort.
+printf '\033]2;Agent Cockpit\007'
+if command -v aerospace >/dev/null 2>&1; then
+  aerospace move-node-to-workspace D >/dev/null 2>&1 || true
+  aerospace workspace D              >/dev/null 2>&1 || true
+fi
+
 # Run from this dir so `python -m agents_tui` resolves the package regardless
 # of the caller's cwd (PYTHONPATH also set as a belt-and-braces fallback).
 export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"
