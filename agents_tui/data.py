@@ -1355,6 +1355,76 @@ def current_tmux_session() -> Optional[str]:
     return None
 
 
+def send_message_to_pane(pane: str, text: str) -> tuple[bool, str]:
+    """Send `text` to a tmux pane (the running Claude session) and submit it.
+
+    The verified mechanics (do NOT deviate — empirically established):
+      1. COPY-MODE GUARD: if the pane is scrolled into copy-mode
+         (`#{pane_in_mode}` == "1"), refuse — send-keys would land in the
+         scrollback, not the prompt. Caller exits copy-mode and retries.
+      2. SINGLE-LINE (no embedded newline): `send-keys -l <text>` (literal, so
+         no key-name interpretation) then a SEPARATE `send-keys Enter` to submit.
+      3. MULTI-LINE (embedded newline): feed the raw text via stdin to
+         `load-buffer -` (avoids ALL shell-quoting issues), then
+         `paste-buffer -p` (bracketed paste -> embedded newlines stay SOFT, not
+         submitted), then a SEPARATE `send-keys Enter` to submit the whole draft.
+
+    Sending to a BUSY Claude is fine — it queues the input and auto-runs; we do
+    NOT wait for idle, send Escape, or interrupt. Returns (True, "") on success,
+    else (False, "<reason>").
+    """
+    if not pane:
+        return (False, "no pane")
+
+    # 1. copy-mode guard
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_in_mode}"],
+            capture_output=True, text=True, timeout=4.0,
+        )
+    except Exception as e:  # noqa: BLE001
+        return (False, f"tmux error: {e}")
+    if r.returncode != 0:
+        return (False, "pane not found")
+    if r.stdout.strip() == "1":
+        return (False, "pane is scrolled (copy-mode); exit it and retry")
+
+    try:
+        if "\n" in text:
+            # multi-line: load the raw text into the paste buffer via stdin,
+            # bracketed-paste it (soft newlines), then submit with one Enter.
+            lb = subprocess.run(
+                ["tmux", "load-buffer", "-"],
+                input=text, text=True, capture_output=True, timeout=4.0,
+            )
+            if lb.returncode != 0:
+                return (False, "load-buffer failed")
+            pb = subprocess.run(
+                ["tmux", "paste-buffer", "-p", "-t", pane],
+                capture_output=True, text=True, timeout=4.0,
+            )
+            if pb.returncode != 0:
+                return (False, "paste-buffer failed")
+        else:
+            # single-line: literal send-keys, then submit.
+            sk = subprocess.run(
+                ["tmux", "send-keys", "-t", pane, "-l", text],
+                capture_output=True, text=True, timeout=4.0,
+            )
+            if sk.returncode != 0:
+                return (False, "send-keys failed")
+        # submit (SEPARATE call so the newline is a real Enter keypress).
+        en = subprocess.run(
+            ["tmux", "send-keys", "-t", pane, "Enter"],
+            capture_output=True, text=True, timeout=4.0,
+        )
+        if en.returncode != 0:
+            return (False, "send Enter failed")
+    except Exception as e:  # noqa: BLE001
+        return (False, f"tmux error: {e}")
+    return (True, "")
+
+
 def kill_session(session_name: str) -> bool:
     """`tmux kill-session -t <session_name>`. Returns True on returncode 0.
 

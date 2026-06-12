@@ -31,9 +31,10 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import Static, TabbedContent, TabPane
+from textual.widgets import Input, Static, TabbedContent, TabPane, TextArea
 
 from . import data
 from .data import Agent
@@ -539,10 +540,13 @@ class KillConfirmScreen(ModalScreen):
     """
 
     # `y` confirms; n cancels. Declared as priority so they're handled before
-    # any focused-widget default. `escape` is handled in on_key (NOT as a
-    # binding) because the App declares a priority `escape` binding
-    # (clear_filter) that would otherwise win even while the modal is open.
-    # Enter is intentionally NOT bound to confirm — a stray Enter must not kill.
+    # any focused-widget default. `escape` is handled by the App's priority
+    # `escape` binding (action_clear_filter), which detects this modal is open
+    # and dismisses it. Textual checks priority bindings App-first (see
+    # App._check_bindings: `reversed(screen._binding_chain)`), so the App's
+    # escape wins over a modal-level one — we therefore route escape through the
+    # App, NOT a binding here. Enter is intentionally NOT bound to confirm — a
+    # stray Enter must not kill.
     BINDINGS = [
         Binding("y", "confirm", "kill", priority=True),
         Binding("n", "cancel", "cancel", priority=True),
@@ -589,6 +593,107 @@ class KillConfirmScreen(ModalScreen):
         # Belt-and-suspenders: swallow EVERY other key so nothing leaks to the
         # app behind the modal and so a stray Enter can never confirm.
         event.stop()
+
+
+class ReplyTextArea(TextArea):
+    """A TextArea whose ENTER submits instead of inserting a newline.
+
+    A vanilla TextArea consumes `enter` in its own `_on_key` (inserting "\\n"
+    and calling event.stop()), so the key never bubbles to the screen. We
+    override `_on_key` to remap the submit/newline semantics for the reply box:
+      - `enter`        -> POST a Submitted message (the screen sends + dismisses)
+                          and do NOT insert a newline.
+      - `shift+enter`  -> insert a literal newline (compose a multi-line draft).
+      - everything else -> default TextArea behavior (normal editing).
+    `escape` is left to the App's priority `escape` binding (which cancels the
+    reply modal), so we deliberately don't touch it here.
+    """
+
+    class Submitted(Message):
+        """Posted when the user presses Enter to send the reply."""
+
+    async def _on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted())
+            return
+        if event.key == "shift+enter":
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            self.scroll_cursor_visible(animate=False)
+            return
+        await super()._on_key(event)
+
+
+class ReplyScreen(ModalScreen):
+    """Inline REPLY overlay: type a message and send it to the selected agent's
+    tmux pane (the running Claude session).
+
+    Look mirrors KillConfirmScreen — dimmed backdrop, a centered card — but with
+    an ACCENT (blue) border (this is a normal, non-destructive action). Header
+    line `Reply to <name>`, then a multi-line ReplyTextArea (focused on open).
+
+    KEY HANDLING (via ReplyTextArea, because a vanilla TextArea consumes Enter
+    before it can bubble to the screen):
+      - `enter`        -> ReplyTextArea posts Submitted -> SEND the draft +
+                          dismiss.
+      - `shift+enter`  -> ReplyTextArea inserts a literal newline (multi-line).
+      - `escape`       -> the App's priority `escape` binding dismisses this
+                          modal (cancel without sending). Textual resolves
+                          priority bindings App-first, so the App's escape owns
+                          modal dismissal; routing it there (not a modal-level
+                          binding) avoids a double-dismiss.
+
+    The actual tmux send lives in data.send_message_to_pane (stdlib-only); this
+    screen only collects the text, calls it, toasts the result, and dismisses.
+    """
+
+    def __init__(self, display_name: str, pane: str) -> None:
+        super().__init__()
+        self._display_name = display_name
+        self._pane = pane
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("Reply to ", style=f"bold {BRIGHT}")
+        header.append(self._display_name, style=f"bold {ACCENT}")
+        hint = Text()
+        hint.append("⏎ send", style=DIM)
+        hint.append("   ·   ", style=DIM)
+        hint.append("⇧⏎ newline", style=DIM)
+        hint.append("   ·   ", style=DIM)
+        hint.append("esc cancel", style=DIM)
+        with Vertical(id="replydialog"):
+            yield Static(header, id="replyheader")
+            yield ReplyTextArea(id="replyinput")
+            yield Static(hint, id="replyhint")
+
+    def on_mount(self) -> None:
+        self.query_one("#replyinput", ReplyTextArea).focus()
+
+    def on_reply_text_area_submitted(self, event: ReplyTextArea.Submitted) -> None:
+        event.stop()
+        self._send()
+
+    def _send(self) -> None:
+        text = self.query_one("#replyinput", ReplyTextArea).text
+        if not text.strip():
+            # Nothing to send — just cancel rather than firing an empty Enter.
+            self.dismiss(False)
+            return
+        ok, err = data.send_message_to_pane(self._pane, text)
+        # Defer the toast to the App so it shows after this screen dismisses.
+        app = self.app
+        name = self._display_name
+        if ok:
+            app.call_after_refresh(lambda: app.notify(f"sent to {name}", timeout=3))
+        else:
+            app.call_after_refresh(
+                lambda: app.notify(f"send failed: {err}", severity="error",
+                                   timeout=4))
+        self.dismiss(ok)
 
 
 class AgentsApp(App):
@@ -649,6 +754,20 @@ class AgentsApp(App):
 
     #filterrow {{ height: 1; }}
     #filter {{ width: 1fr; color: {DIM}; }}
+    /* The filter Input is hidden (display:none) in command mode and only
+       revealed while in filter mode (entered with `/`). When shown it replaces
+       the #filter hint label in the row. A compact, borderless single-line. */
+    #filterinput {{
+        width: 1fr;
+        height: 1;
+        padding: 0;
+        border: none;
+        background: {BG};
+        color: {BRIGHT};
+        display: none;
+    }}
+    #filterinput.filtering {{ display: block; }}
+    #filter.filtering {{ display: none; }}
     #matchcount {{ width: auto; color: {DIM}; content-align: right middle; }}
 
     #agentlist {{
@@ -722,6 +841,40 @@ class AgentsApp(App):
     }}
     #killbody {{ width: 1fr; height: auto; }}
 
+    /* Inline REPLY overlay: same dim backdrop as the kill modal but an ACCENT
+       (blue) border — this is a normal, non-destructive action. */
+    ReplyScreen {{
+        align: center middle;
+        background: $background 60%;
+    }}
+    #replydialog {{
+        width: 80;
+        height: auto;
+        max-width: 90%;
+        padding: 1 2;
+        background: {BG};
+        border: round {ACCENT};
+    }}
+    #replyheader {{ width: 1fr; height: 1; }}
+    #replyinput {{
+        width: 1fr;
+        height: 8;
+        margin: 1 0;
+        background: {BG};
+        border: round {DIM} 50%;
+        /* Match the two-pane (list/preview/context) thin muted scrollbar so the
+           reply box doesn't render the blue-on-black Textual default. Same
+           values as #agentlist / #preview / #context above. */
+        scrollbar-size-vertical: 1;
+        scrollbar-color: #9399b2;
+        scrollbar-color-hover: #b4befe;
+        scrollbar-color-active: #b4befe;
+        scrollbar-background: #181825;
+        scrollbar-background-hover: #181825;
+        scrollbar-background-active: #181825;
+    }}
+    #replyhint {{ width: 1fr; height: 1; }}
+
     Footer {{
         height: 1;
         background: {BG};
@@ -752,6 +905,9 @@ class AgentsApp(App):
         super().__init__(**kwargs)
         self._selected_key: str | None = None  # session_id or session name
         self._filtered: list[Agent] = []
+        # True while the filter Input is focused (filter mode, entered with `/`).
+        # In command mode (default) plain letters are commands, NOT filter chars.
+        self._filter_mode: bool = False
         # key -> stable AgentRow widget (Issue 1: in-place keyed updates so
         # refresh ticks never tear down + remount unchanged rows).
         self._rows: dict[str, AgentRow] = {}
@@ -776,7 +932,8 @@ class AgentsApp(App):
                     with Vertical(id="left"):
                         yield Static("agents", classes="panelabel")
                         with Horizontal(id="filterrow"):
-                            yield Static("❯ type to filter…", id="filter")
+                            yield Static("❯ / to filter…", id="filter")
+                            yield Input(placeholder="filter…", id="filterinput")
                             yield Static("0/0", id="matchcount")
                         yield VerticalScroll(id="agentlist")
                     with Vertical(id="right"):
@@ -1001,6 +1158,17 @@ class AgentsApp(App):
                 return a
         return None
 
+    def _modal_active(self) -> bool:
+        """True while a ModalScreen (reply or kill-confirm) is on the stack.
+
+        When true the background list must be fully inert: every command
+        action_* and the global on_key early-return so ONLY the modal responds
+        to input. The modal owns its own keys (typing, Enter/Shift+Enter, y/n).
+        `escape` is the one exception NOT blanket-guarded: it reaches the App's
+        priority `escape` binding (action_clear_filter), which dismisses the
+        active modal — so Esc still cancels both modals."""
+        return isinstance(self.screen, (ReplyScreen, KillConfirmScreen))
+
     # ---- selection movement ----
 
     def _move(self, delta: int) -> None:
@@ -1070,13 +1238,19 @@ class AgentsApp(App):
     # ---- key actions ----
 
     def action_move_down(self) -> None:
+        if self._modal_active():
+            return
         self._move(1)
 
     def action_move_up(self) -> None:
+        if self._modal_active():
+            return
         self._move(-1)
 
     def action_next_alert(self) -> None:
         """→ : jump selection to the next needs-input agent (wrap)."""
+        if self._modal_active():
+            return
         needy = [a for a in self._filtered if a.state == "needs-input"]
         if not needy:
             self.notify("no agents need attention", timeout=2)
@@ -1107,6 +1281,8 @@ class AgentsApp(App):
         title match (2+ windows) we REFUSE to focus a possibly-wrong window and
         say so; on no match we keep the existing "attach it once" message.
         """
+        if self._modal_active():
+            return
         a = self.selected_agent
         if a is None:
             return
@@ -1125,14 +1301,26 @@ class AgentsApp(App):
             self.notify(f"could not focus window {wid} (gone?)", timeout=3)
 
     def action_clear_filter(self) -> None:
-        # The App declares `escape` as a PRIORITY binding, so it fires even when
-        # the kill-confirm modal is open (priority bindings are checked before
-        # the focused screen's on_key). When the modal IS open, escape must
-        # CANCEL the modal, not clear the filter — defer to it.
+        # The App declares `escape` as a PRIORITY binding. Textual resolves
+        # priority bindings App-FIRST (App._check_bindings iterates
+        # `reversed(screen._binding_chain)`), so this fires even when a modal is
+        # open — making the App the single owner of escape -> modal dismissal
+        # (a modal-level escape binding would be shadowed by this one). The
+        # blanket on_key modal-guard deliberately does NOT cover escape, so this
+        # still runs while a modal is up.
+        # 1. kill-confirm modal open -> escape CANCELS the modal.
         if isinstance(self.screen, KillConfirmScreen):
             self.screen.dismiss(False)
             return
-        # idempotent: always reset to the full list on esc.
+        # 2. reply modal open -> escape CANCELS the modal (without sending).
+        if isinstance(self.screen, ReplyScreen):
+            self.screen.dismiss(False)
+            return
+        # 3. filter mode -> escape CANCELS the filter (clears + back to command).
+        if self._filter_mode:
+            self._exit_filter_mode(keep=False)
+            return
+        # 4. otherwise idempotent: reset to the full list.
         self.filter_text = ""
         self._update_filter_display()
         self._rebuild_list()
@@ -1159,7 +1347,10 @@ class AgentsApp(App):
         in action_clear_filter), so we no-op here while that modal is on the
         stack and let the keystroke stay within the modal.
         """
-        if isinstance(self.screen, KillConfirmScreen):
+        if self._modal_active():
+            return
+        # In filter mode the Input owns Tab (e.g. focus); don't switch tabs.
+        if self._filter_mode:
             return
         try:
             tabs = self.query_one("#tabs", TabbedContent)
@@ -1188,6 +1379,8 @@ class AgentsApp(App):
           - Otherwise push the mandatory KillConfirmScreen; the kill only runs
             if the user explicitly confirms (`y`). Default is cancel.
         """
+        if self._modal_active():
+            return
         a = self.selected_agent
         if a is None:
             return
@@ -1256,22 +1449,112 @@ class AgentsApp(App):
             return survivors[dead_idx]
         return survivors[-1]
 
-    # ---- raw key handling (filter typing + nav) ----
+    # ---- filter mode (entered with `/`) ----
 
-    # keys we explicitly handle as navigation/commands (never typed into filter)
+    def _enter_filter_mode(self) -> None:
+        """Show + focus the filter Input. The Input's value (not captured key
+        events) now drives the live filter via on_input_changed."""
+        self._filter_mode = True
+        inp = self.query_one("#filterinput", Input)
+        self.query_one("#filter", Static).add_class("filtering")
+        inp.add_class("filtering")
+        # seed the Input with any pre-existing filter so re-entering edits it.
+        inp.value = self.filter_text
+        inp.focus()
+
+    def _exit_filter_mode(self, *, keep: bool) -> None:
+        """Leave filter mode -> command mode.
+
+        keep=True  -> LOCK: the filter stays applied; hide the Input and focus
+                      the (filtered) list with the top result selected so the
+                      user can immediately act on it.
+        keep=False -> CANCEL: clear the filter and return to the full list.
+        """
+        self._filter_mode = False
+        inp = self.query_one("#filterinput", Input)
+        inp.remove_class("filtering")
+        self.query_one("#filter", Static).remove_class("filtering")
+        if not keep:
+            self.filter_text = ""
+            inp.value = ""
+            self._rebuild_list()
+        else:
+            # land selection on the top filtered result so it's immediately
+            # actionable (reply/open/kill) from command mode.
+            if self._filtered:
+                self._selected_key = self._key(self._filtered[0])
+                self._refresh_selection_classes()
+                self._update_preview()
+                self._scroll_to_selected()
+        self._update_filter_display()
+        # return focus to the app (away from the Input) so command keys work.
+        try:
+            self.query_one("#agentlist", VerticalScroll).focus()
+        except Exception:
+            self.set_focus(None)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Live-filter as the user types in the filter Input."""
+        if event.input.id != "filterinput":
+            return
+        self.filter_text = event.value
+        self._rebuild_list()
+
+    # ---- reply (entered with `r`) ----
+
+    def _request_reply_selected(self) -> None:
+        """Open the inline Reply overlay for the selected agent.
+
+        No-op (with a toast) when nothing is selected. Reply is driven from the
+        AGENTS tab's selected card; on the Context tab `r` does nothing (v1).
+        """
+        if self._modal_active():
+            return
+        a = self.selected_agent
+        if a is None:
+            self.notify("no agent selected", timeout=2)
+            return
+        pane = a.active_pane
+        if not pane:
+            self.notify("no pane to send to", timeout=2)
+            return
+        display_name = AgentRow._card_title(a)
+        self.push_screen(ReplyScreen(display_name, pane))
+
+    # ---- raw key handling (modal command/filter input model) ----
+
+    # Non-printable nav/command keys handled here; everything else falls through.
     _NAV_KEYS = {"down", "up", "right", "enter", "escape", "backspace",
                  "left", "tab", "shift+tab", "home", "end", "pageup",
                  "pagedown"}
 
     def on_key(self, event) -> None:
         key = event.key
-        # On the CONTEXT tab the Agents-tab nav/filter handling is disabled:
+        # MODAL GUARD (the main capture fix): while ANY ModalScreen (reply or
+        # kill-confirm) is on the stack, the background list must be completely
+        # inert. Return WITHOUT stopping the event so it stays with the modal
+        # screen (which owns typing, Enter/Shift+Enter, and its own priority
+        # `escape` cancel). Every command action_* also guards on _modal_active,
+        # but this short-circuit keeps the App's global on_key from acting on
+        # backspace (kill) / arrows (move) / r / slash etc. while a modal is up.
+        if self._modal_active():
+            return
+        # While in filter mode the Input owns the keyboard: Enter LOCKS the
+        # filter, Esc CANCELS it; all other keys flow to the Input (live filter
+        # via on_input_changed). We intercept ONLY enter/escape here.
+        if self._filter_mode:
+            if key == "enter":
+                self._exit_filter_mode(keep=True); event.stop(); return
+            if key == "escape":
+                self._exit_filter_mode(keep=False); event.stop(); return
+            return  # let the Input handle the keystroke
+        # On the CONTEXT tab the Agents-tab command handling is disabled:
         # Tab (cycle tabs), ctrl+c (quit), and escape are priority Bindings that
         # fire independently; everything else (↑↓ scroll, etc.) falls through to
-        # default handling so the context pane scrolls normally and no keystroke
-        # leaks into the (hidden) Agents-tab filter.
+        # default handling so the context pane scrolls normally.
         if self._active_tab() != "agents-tab":
             return
+        # COMMAND MODE. Plain letters are NO LONGER a filter.
         if key == "down":
             self.action_move_down(); event.stop(); return
         if key == "up":
@@ -1280,32 +1563,20 @@ class AgentsApp(App):
             self.action_next_alert(); event.stop(); return
         if key == "enter":
             self.action_open_window(); event.stop(); return
+        if key == "slash":
+            self._enter_filter_mode(); event.stop(); return
+        if key == "r":
+            self._request_reply_selected(); event.stop(); return
         if key == "escape":
             # handled by the priority Binding; keep here as a fallback.
             self.action_clear_filter(); event.stop(); return
-        if key == "q" and not self.filter_text:
-            # bare `q` quits; `q` typed into a non-empty filter is a char.
+        if key == "q":
             self.action_quit(); event.stop(); return
         if key == "backspace":
-            if self.filter_text:
-                # non-empty filter: Backspace edits the filter (delete a char).
-                self.filter_text = self.filter_text[:-1]
-                self._update_filter_display()
-                self._rebuild_list()
-            else:
-                # empty filter: Backspace triggers the kill-confirm flow on the
-                # selected agent (mirrors the `q`-quits-only-when-empty rule).
-                self._request_kill_selected()
+            # Backspace triggers the kill-confirm flow on the selected agent.
+            self._request_kill_selected()
             event.stop(); return
-        if key in self._NAV_KEYS:
-            return  # leave other nav keys to default handling
-        # printable single chars (incl. space) -> filter
-        ch = event.character
-        if ch is not None and len(ch) == 1 and (ch == " " or ch.isprintable()):
-            self.filter_text += ch
-            self._update_filter_display()
-            self._rebuild_list()
-            event.stop()
+        # All other keys (including plain letters) are ignored in command mode.
 
     def _update_filter_display(self) -> None:
         w = self.query_one("#filter", Static)
@@ -1315,7 +1586,7 @@ class AgentsApp(App):
             t.append(self.filter_text, style=BRIGHT)
             w.update(t)
         else:
-            w.update(Text("❯ type to filter…", style=DIM))
+            w.update(Text("❯ / to filter…", style=DIM))
 
     # mouse click selects a row (nice-to-have)
     def on_click(self, event) -> None:
@@ -1341,11 +1612,12 @@ class FooterBar(Static):
         t = Text()
         chips = [
             ("↿⇂", "move"),
-            ("⏎", "open window"),
+            ("r", "reply"),
+            ("/", "filter"),
+            ("⏎", "open"),
             ("→", "next alert"),
-            ("", "type filter"),
-            ("esc", "clear"),
-            ("Tab", "tabs"),
+            ("Tab", "tab"),
+            ("⌫", "kill"),
             ("^c", "quit"),
         ]
         first = True
