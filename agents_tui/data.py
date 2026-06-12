@@ -1,9 +1,9 @@
 """data.py — gather + derive agent state for the agents-tui dashboard.
 
 All reads are from sources that already exist in the cockpit:
-  - tmux        : session list, active pane, identity stamps (@cc_name/
-                  @cc_color), attention tint (window-active-style bg=colour52),
-                  the aerospace wid stamp (@aerospace_wid).
+  - tmux        : session list, active pane, attention tint
+                  (window-active-style bg=colour52), the aerospace wid stamp
+                  (@aerospace_wid).
   - ctx registry: /tmp/claude-ctx/<session_id>.json  -> ctx% + cwd + ts.
   - transcripts : ~/.claude/projects/*/<session_id>.jsonl -> last message + age.
 
@@ -35,7 +35,6 @@ from typing import Optional
 
 CTX_DIR = "/tmp/claude-ctx"
 NEEDY_STYLE = "bg=colour52"  # set by ~/.claude/hooks/tmux-attention.sh
-VALID_COLORS = {"red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"}
 
 # aerospace binary (matches the path the pilot test uses; falls back to PATH).
 AEROSPACE_BIN = "/opt/homebrew/bin/aerospace"
@@ -74,12 +73,6 @@ MAX_LINE_BYTES = 200 * 1024  # skip single records larger than this (attachment/
 
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/*/{sid}.jsonl")
 
-# 256-colour identity-dot codes mirror the classic script (grey = unstamped).
-_COLOR_CODE = {
-    "red": 196, "blue": 39, "green": 46, "yellow": 226,
-    "purple": 129, "orange": 208, "pink": 205, "cyan": 51,
-}
-
 # Section ordering for the list: needs-you (red) on top, then running, then
 # inactive (idle) at the bottom. Drives the PRIMARY sort key in gather_agents.
 # Unknown states sink to the inactive section.
@@ -97,10 +90,8 @@ class Agent:
     session_id: Optional[str] = None   # claude uuid (from ctx join), may be None
     active_pane: Optional[str] = None  # "%NN"
     project: str = ""                  # cwd basename
-    task: str = ""                     # @cc_name / git branch / prettified name
-    tag_name: Optional[str] = None     # the raw @cc_name tag, ONLY when stamped
+    task: str = ""                     # git branch / prettified session name
     pid: str = ""                      # trailing digits of cc-<base>-<pid>, else ""
-    color: str = "grey"                # identity color name
     cwd: str = ""                      # abs path
     pct: Optional[int] = None          # ctx % (shown regardless of age)
     state: str = "idle"                # "needs-input" | "working" | "idle"
@@ -110,9 +101,8 @@ class Agent:
     snippet: str = ""                  # one-line last-message/status snippet
     aerospace_wid: Optional[str] = None
     # cleaned Claude session title from the active pane (#{pane_title}), spinner
-    # glyph stripped. Used as the card title (precedence below tag_name) and as
-    # the title-match fallback for aerospace window resolution. None when empty
-    # or a useless/generic value.
+    # glyph stripped. Used as the card title and as the title-match fallback for
+    # aerospace window resolution. None when empty or a useless/generic value.
     pane_title: Optional[str] = None
     panes: list[str] = field(default_factory=list)
     # per-session metadata from the statusline tap (often empty on old taps
@@ -124,10 +114,6 @@ class Agent:
     five_h_reset: Optional[int] = None  # epoch seconds
     seven_d_pct: Optional[float] = None  # 7d rolling usage-limit %, 0-100
     seven_d_reset: Optional[int] = None  # epoch seconds
-
-    @property
-    def color_code(self) -> int:
-        return _COLOR_CODE.get(self.color, 244)
 
     @property
     def label(self) -> str:
@@ -980,15 +966,7 @@ def gather_agents() -> list[Agent]:
         ctx_seven_d_pct = ctx.get("seven_d_pct") if ctx else None
         ctx_seven_d_reset = ctx.get("seven_d_reset") if ctx else None
 
-        # identity stamps from the active pane
-        name = pane_opt(ap, "@cc_name") if ap else ""
-        # tag_name preserves the RAW @cc_name distinctly from the task fallback
-        # (git branch / prettified session), so the card can show the human
-        # label Kiran gave the agent as a prominent title. Only set when stamped.
-        tag_name = name or None
-        color = pane_opt(ap, "@cc_color") if ap else ""
-        if color not in VALID_COLORS:
-            color = "grey"
+        # aerospace window-id stamp from the active pane
         wid = pane_opt(ap, "@aerospace_wid") if ap else ""
 
         # "working" detection: Claude animates a spinner glyph in the RAW pane
@@ -1006,12 +984,9 @@ def gather_agents() -> list[Agent]:
         project = os.path.basename(cwd) if cwd else prettify(sess)
         pid = extract_pid(sess)
 
-        # task: @cc_name -> git branch -> prettified session name
-        if name:
-            task = name
-        else:
-            branch = git_branch(cwd)
-            task = branch if branch else prettify(sess)
+        # task: git branch -> prettified session name
+        branch = git_branch(cwd)
+        task = branch if branch else prettify(sess)
 
         # attention?
         needy = session_needy(panes)
@@ -1064,9 +1039,7 @@ def gather_agents() -> list[Agent]:
             active_pane=ap,
             project=project,
             task=task,
-            tag_name=tag_name,
             pid=pid,
-            color=color,
             cwd=cwd,
             pct=pct,
             state=state,
@@ -1207,15 +1180,32 @@ def focus_window(wid: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def current_tmux_session() -> Optional[str]:
-    """The tmux session the COCKPIT ITSELF is attached to (the self-session).
-
-    Uses `tmux display -p '#S'` which, when run from inside a tmux client,
-    returns the session of the attached client. Returns None when there is no
-    attached client / we're not running inside tmux (so there is no self to
-    protect). We do NOT raise — a missing client just means "no self-session".
+    """The tmux session the COCKPIT process is genuinely running inside,
+    found by PROCESS TRUTH — a tmux pane whose pane-process is an ancestor of
+    our own pid — NOT by the inherited $TMUX/$TMUX_PANE env. Trusting that env
+    is unsafe: a cockpit launched from a Ghostty with a stale inherited $TMUX
+    (leftover agent-spawn environment) would otherwise resolve `tmux display
+    -p '#S'` to a FOREIGN session and make the kill guard refuse legit kills
+    ("can't kill the cockpit's own session"). Returns None when we're not
+    actually inside any live tmux pane — then there is no self to protect and
+    the guard correctly allows the kill.
     """
-    out = _run(["tmux", "display", "-p", "#S"]).strip()
-    return out or None
+    try:
+        me = str(os.getpid())
+        parent = _ps_parent_map()                # pid -> ppid, string-keyed
+        anc = set(_ancestors(me, parent))        # ancestor pids (strings), excl. self
+        anc.add(me)                              # include our own pid
+        out = _run(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}"])
+        for line in out.splitlines():
+            if "\t" not in line:
+                continue
+            pid_s, sess = line.split("\t", 1)
+            pane_pid = pid_s.strip()
+            if pane_pid and pane_pid in anc:
+                return sess.strip() or None
+    except Exception:
+        return None
+    return None
 
 
 def kill_session(session_name: str) -> bool:

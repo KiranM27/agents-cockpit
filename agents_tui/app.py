@@ -148,24 +148,24 @@ class AgentRow(Static):
 
     @staticmethod
     def _card_title(a: Agent) -> str:
-        """Headline for the card. Precedence: @cc_name tag -> cleaned pane_title
-        (the live Claude session name) -> `project · task` label fallback."""
-        return a.tag_name or a.pane_title or a.label
+        """Headline for the card. Precedence: cleaned pane_title (the live Claude
+        session title) -> `project · task` label fallback."""
+        return a.pane_title or a.label
 
     @staticmethod
     def _has_subtitle(a: Agent) -> bool:
-        """True when the title came from tag_name or pane_title (i.e. it's NOT
-        the `project · task` label), so the label shows as a dim subtitle and
+        """True when the title came from pane_title (i.e. it's NOT the
+        `project · task` label), so the label shows as a dim subtitle and
         the card needs the extra (3rd) content line."""
-        return bool(a.tag_name or a.pane_title)
+        return bool(a.pane_title)
 
     def _apply_tagged_class(self, agent: Agent | None) -> None:
         """Toggle the `.tagged` class so the CSS picks the right fixed height.
 
         A card with a SUBTITLE has 3 content lines (title + subtitle + snippet)
         and needs one extra row vs a plain 2-line card. The subtitle appears
-        whenever the title came from a tag_name OR a cleaned pane_title (most
-        live sessions have a pane_title, so most cards are now 3-line). We use a
+        whenever the title came from a cleaned pane_title (most live sessions
+        have a pane_title, so most cards are now 3-line). We use a
         FIXED height per class (not `height: auto`) on purpose: auto-height
         re-measures content width and makes the right-aligned/padded stat line
         wrap, inflating the card. Toggling on the reactive keeps this in lockstep
@@ -192,9 +192,9 @@ class AgentRow(Static):
         # TITLE (line 1): glyph + the agent's headline + a right-aligned
         # `ctx NN% · <effort> · <age>` cluster (the effort token is omitted when
         # effort is absent; ctx and age are always shown). Headline precedence:
-        # @cc_name tag -> cleaned pane_title (the live Claude session name) ->
-        # `project · task`. When the headline is NOT the label, `project · task`
-        # drops to a dim subtitle line below.
+        # cleaned pane_title (the live Claude session title) -> `project · task`.
+        # When the headline is NOT the label, `project · task` drops to a dim
+        # subtitle line below.
         #
         # The right cluster is built FIRST so we can RESERVE its exact cell width
         # and TRUNCATE the title with `…` rather than let it collide with the
@@ -226,7 +226,7 @@ class AgentRow(Static):
         line1.append(" " * gap)
         line1.append_text(cluster1)
 
-        # SUBTITLE (when the title is a tag_name or pane_title): dim
+        # SUBTITLE (when the title is a pane_title): dim
         # `project · task` under the headline.
         subtitle: Text | None = None
         if self._has_subtitle(a):
@@ -722,9 +722,9 @@ class AgentsApp(App):
         out = []
         for a in agents:
             # haystack = the label PLUS the session name Kiran actually sees on
-            # the card (tag_name and/or cleaned pane_title), so he can filter by
-            # what's on screen. Joined with spaces so token-fuzzy still works.
-            extras = " ".join(x for x in (a.tag_name, a.pane_title) if x)
+            # the card (the cleaned pane_title), so he can filter by what's on
+            # screen. Joined with spaces so token-fuzzy still works.
+            extras = a.pane_title or ""
             hay = (a.label + " " + extras).lower().strip()
             if q in hay:
                 out.append(a)

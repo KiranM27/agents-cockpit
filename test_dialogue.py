@@ -13,11 +13,9 @@ kinds + lengths + structural facts):
         green ✓ result lines (dialogue prose only).
     A3. Turns are spaced (each rendered turn carries a trailing blank line).
 
-  CHANGE B — LEFT CARDS @cc_name as title:
-    B1. A tagged Agent (tag_name set) renders tag_name as the title line and
-        `project · task` (== label) as a SEPARATE dim subtitle line, and gets
-        the .tagged height class (3 content lines, no clip).
-    B2. An untagged Agent renders label as the title and NO empty subtitle
+  CHANGE B — LEFT CARDS title/subtitle:
+    B1. (retired) the /tag feature is gone; tag-title rendering no longer exists.
+    B2. An Agent renders label as the title and NO empty subtitle
         line (exactly 2 content lines), no .tagged class.
     B3. SVG snapshot exported to /tmp/agents-tui-cards2.svg.
 """
@@ -133,7 +131,7 @@ async def run() -> int:
             tagged = Agent(
                 session="cc-demo-1627", session_id="sid-tagged",
                 project="lexi-backend", task="checkpoint-rollback",
-                tag_name="checkpoint-rollback-1627", state="working",
+                state="working",
                 age_seconds=42,
                 snippet="Refactoring the pane pooling so identity persists",
                 effort="high", pct=37, five_h_pct=58.0)

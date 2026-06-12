@@ -16,10 +16,10 @@ and rendered card text which is just session titles):
 
   CHANGE 2 — pane_title as card name:
     2a. clean_pane_title strips the spinner glyph on the documented inputs.
-    2b. An untagged Agent WITH a pane_title renders the cleaned pane_title as the
+    2b. An Agent WITH a pane_title renders the cleaned pane_title as the
         title line and `project · task` as a SEPARATE dim subtitle (3 lines,
-        .tagged height). Precedence tag_name > pane_title > label verified.
-    2c. _matches() filters on pane_title (and tag_name), not just label.
+        .tagged height). Precedence pane_title > label verified.
+    2c. _matches() filters on pane_title, not just label.
 
   CHANGE 3 — row cluster = effort + ctx only, ctx un-gated:
     3a. NO live row's rendered text contains "5h" (removed from rows).
@@ -309,7 +309,7 @@ async def run() -> int:
             ptitle_as_title_ok = True
             for r in rows:
                 a = r.agent
-                if a and a.pane_title and not a.tag_name:
+                if a and a.pane_title:
                     lines = row_text(r).split("\n")
                     title_line = lines[0]
                     sub_line = lines[1] if len(lines) > 1 else ""

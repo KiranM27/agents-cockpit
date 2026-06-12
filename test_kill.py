@@ -71,8 +71,7 @@ def cleanup_scratch() -> None:
 
 def make_scratch_agent() -> Agent:
     """An Agent whose .session is the scratch session (display name distinct)."""
-    return Agent(session=SCRATCH, project="scratch", task="kill-test",
-                 tag_name="kill-test-scratch")
+    return Agent(session=SCRATCH, project="scratch", task="kill-test")
 
 
 # --------------------------------------------------------------------------
@@ -235,8 +234,8 @@ async def run() -> int:
                   f"(modal={modal_open} alive={alive_with_modal})")
 
             # verify the modal shows BOTH the display name and the tmux session.
-            # The display name is the selected agent's card title (tag_name ->
-            # pane_title -> label) — read it off the live agent rather than
+            # The display name is the selected agent's card title (pane_title ->
+            # label) — read it off the live agent rather than
             # assuming, since the scratch session is a real gathered session.
             from agents_tui.app import AgentRow as _AR
             sel_now = app.selected_agent
