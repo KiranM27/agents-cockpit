@@ -36,6 +36,25 @@ from typing import Optional
 CTX_DIR = "/tmp/claude-ctx"
 NEEDY_STYLE = "bg=colour52"  # set by ~/.claude/hooks/tmux-attention.sh
 
+# ctx-monitor sidecar files in CTX_DIR (see ~/.claude/tools/ctx-monitor/
+# ctx-monitor.py). monitor-state.json holds per-pane cycle STATE; monitor.lock
+# is the single-instance flock with the holder PID stamped inside.
+MONITOR_STATE_FILE = os.path.join(CTX_DIR, "monitor-state.json")
+MONITOR_LOCK_FILE = os.path.join(CTX_DIR, "monitor.lock")
+
+# Internal monitor STATE identifiers -> human-readable dashboard labels.
+# Mirrors ctx-monitor.py's STATE_LABELS EXACTLY (its ARMED/SAVE_SENT/...).
+# The raw identifiers are what monitor-state.json persists; we map for display.
+MONITOR_STATE_LABELS = {
+    "ARMED": "watching",
+    "SAVE_SENT": "checkpoint requested",
+    "COMPACT_SENT": "compacting",
+    "REORIENT_SENT": "reorienting",
+    "ERROR": "ERROR - needs attention",
+}
+# Default raw state for a session the monitor has no record of yet.
+MONITOR_DEFAULT_STATE = "ARMED"
+
 # aerospace binary (matches the path the pilot test uses; falls back to PATH).
 AEROSPACE_BIN = "/opt/homebrew/bin/aerospace"
 
@@ -135,6 +154,31 @@ class Agent:
     def seven_d_resets_in(self) -> str:
         """'resets in' string for the 7d window, '' if no/elapsed reset."""
         return humanize_resets_in(self.seven_d_reset)
+
+
+@dataclass
+class ContextRow:
+    """One row of the Context-tab dashboard (mirrors ctx-monitor's table).
+
+    Columns map 1:1 to the monitor's render_lines(): serial #, PANE, NAME, DIR
+    (repo dir basename), SESSION (first 8 chars of session id), CONTEXT (used %),
+    STATE. `state_label` is the human-readable wording; `is_error` flags the row
+    for RED rendering (mirrors the monitor's ERROR row tint).
+    """
+    pane: str                  # tmux pane id, e.g. "%0" ("-" if unknown)
+    name: str                  # the cockpit's resolved NAME (better than @cc_name)
+    dir: str                   # repo dir basename
+    session8: str              # first 8 chars of session id ("-" if unknown)
+    pct: Optional[int]         # ctx used %
+    state_label: str           # human-readable STATE
+    is_error: bool             # True -> render the row RED
+
+
+@dataclass
+class MonitorLiveness:
+    """Liveness of the ctx-monitor sidecar (from monitor.lock's stamped PID)."""
+    alive: bool
+    pid: Optional[int]
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1118,109 @@ def gather_agents() -> list[Agent]:
                                a.age_seconds is None,
                                a.age_seconds if a.age_seconds is not None else 0.0))
     return agents
+
+
+# ---------------------------------------------------------------------------
+# Context tab — mirror the ctx-monitor dashboard
+#
+# We REUSE the cockpit's own per-session resolution (gather_agents -> good NAME
+# via process-truth pane_title, ctx% from the tap, DIR from cwd, session8 from
+# the resolved sessionId), then JOIN the monitor's per-pane cycle STATE from
+# monitor-state.json by session_id. That gives better NAMEs than the raw
+# monitor's @cc_name while keeping the monitor's exact column set + wording.
+# ---------------------------------------------------------------------------
+
+def load_monitor_states_by_sid() -> dict[str, str]:
+    """Read monitor-state.json -> { session_id: raw_state }.
+
+    The monitor persists `{"saved_at": ..., "panes": {pane_id: {session_id,
+    state, ...}}}`. We key by the record's session_id (not pane_id) so the join
+    is robust to pane recycling. If two panes report the same session_id, last
+    one wins (a harmless edge — the monitor keys cycles per pane). Missing file /
+    bad JSON -> {} (the monitor may simply not be running).
+    """
+    try:
+        with open(MONITOR_STATE_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, str] = {}
+    panes = data.get("panes")
+    if not isinstance(panes, dict):
+        return out
+    for rec in panes.values():
+        if not isinstance(rec, dict):
+            continue
+        sid = rec.get("session_id")
+        state = rec.get("state")
+        if sid and state:
+            out[str(sid)] = str(state)
+    return out
+
+
+def monitor_liveness() -> MonitorLiveness:
+    """Read monitor.lock's stamped PID and test it with os.kill(pid, 0).
+
+    The lock file holds the holder's bare PID (see ctx-monitor's
+    acquire_instance_lock). os.kill(pid, 0) raises ProcessLookupError when the
+    pid is dead and PermissionError when it's alive but not ours (still alive).
+    Missing/empty/garbage lock -> not running.
+    """
+    try:
+        with open(MONITOR_LOCK_FILE) as f:
+            raw = f.read().strip()
+    except OSError:
+        return MonitorLiveness(alive=False, pid=None)
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        return MonitorLiveness(alive=False, pid=None)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return MonitorLiveness(alive=False, pid=pid)
+    except PermissionError:
+        return MonitorLiveness(alive=True, pid=pid)
+    except OSError:
+        return MonitorLiveness(alive=False, pid=pid)
+    return MonitorLiveness(alive=True, pid=pid)
+
+
+def gather_context_rows(agents: Optional[list[Agent]] = None) -> list[ContextRow]:
+    """Build the Context-tab rows: one per live agent, sorted by CONTEXT %
+    DESCENDING (most urgent at top).
+
+    Reuses `agents` (pass the already-gathered list to avoid a second tmux/ps
+    sweep; gathers fresh if None). NAME/DIR/ctx%/session8 come from the cockpit's
+    own resolution; STATE is joined from monitor-state.json by session_id, with a
+    sensible default (watching) where the monitor has no record.
+    """
+    if agents is None:
+        agents = gather_agents()
+    states_by_sid = load_monitor_states_by_sid()
+
+    rows: list[ContextRow] = []
+    for a in agents:
+        raw_state = (states_by_sid.get(a.session_id)
+                     if a.session_id else None) or MONITOR_DEFAULT_STATE
+        # NAME: the cockpit's resolved card title (cleaned pane_title) -> label.
+        name = a.pane_title or a.label or "-"
+        dir_name = os.path.basename(cwd_) if (cwd_ := a.cwd) else "-"
+        session8 = a.session_id[:8] if a.session_id else "-"
+        rows.append(ContextRow(
+            pane=a.active_pane or "-",
+            name=name,
+            dir=dir_name or "-",
+            session8=session8,
+            pct=a.pct,
+            state_label=MONITOR_STATE_LABELS.get(raw_state, raw_state),
+            is_error=(raw_state == "ERROR"),
+        ))
+
+    # Sort by CONTEXT % DESCENDING (highest first). Rows with no ctx% sink to the
+    # bottom (treated as -1).
+    rows.sort(key=lambda r: (r.pct if r.pct is not None else -1), reverse=True)
+    return rows
 
 
 def aerospace_windows() -> list[tuple[str, str, str]]:

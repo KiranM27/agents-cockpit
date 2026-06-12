@@ -22,8 +22,10 @@ from __future__ import annotations
 import difflib
 from datetime import datetime
 
+from rich import box
 from rich.console import Group
 from rich.markdown import Markdown
+from rich.table import Table
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -31,7 +33,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Static, TabbedContent, TabPane
 
 from . import data
 from .data import Agent
@@ -90,14 +92,10 @@ def _pct_str(pct) -> str:
 
 
 class Header(Static):
-    """Top bar: title left, live counts + clock right."""
+    """Top-right stats strip: live counts + clock, right-aligned, sharing the
+    tab row."""
 
     def update_counts(self, total: int, working: int, attention: int) -> None:
-        t = Text()
-        t.append("◆ ", style=f"bold {ACCENT}")
-        t.append("agents", style=f"bold {BRIGHT}")
-        t.append(" tui", style=DIM)
-
         right = Text()
         right.append(f"{total} agents", style=BRIGHT)
         right.append("  ·  ", style=DIM)
@@ -107,15 +105,7 @@ class Header(Static):
                      style=ATTN if attention else DIM)
         right.append("  ·  ", style=DIM)
         right.append(datetime.now().strftime("%H:%M:%S"), style=DIM)
-
-        # pad between left and right to fill the width
-        width = max(self.size.width, 40)
-        gap = width - t.cell_len - right.cell_len
-        if gap < 1:
-            gap = 1
-        t.append(" " * gap)
-        t.append_text(right)
-        self.update(t)
+        self.update(right)
 
 
 class AgentRow(Static):
@@ -464,6 +454,76 @@ class PreviewPane(VerticalScroll):
         return t
 
 
+class ContextPane(VerticalScroll):
+    """Context tab: a monospace table mirroring the ctx-monitor dashboard.
+
+    Columns match ctx-monitor.py's render_lines() EXACTLY: serial #, PANE, NAME,
+    DIR, SESSION (session8), CONTEXT (used %), STATE. A liveness line at the top
+    reports whether the monitor sidecar is running (from monitor.lock's PID).
+    ERROR rows render RED, mirroring the monitor. Rows are pre-sorted by CONTEXT
+    % descending in data.gather_context_rows(). Two persistent Statics (liveness
+    + table) updated in place — same no-remount discipline as PreviewPane.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._w_liveness: Static | None = None
+        self._w_table: Static | None = None
+
+    def _ensure_widgets(self) -> None:
+        if self._w_liveness is not None:
+            return
+        self._w_liveness = Static()
+        self._w_table = Static()
+        self.mount(self._w_liveness, self._w_table)
+
+    def update_rows(self, rows: list, liveness) -> None:
+        """Re-render the liveness line + the table from prepared data (all
+        file-reading already done in data.py — this is pure presentation)."""
+        self._ensure_widgets()
+
+        live = Text()
+        if liveness.alive:
+            live.append("monitor: ", style=DIM)
+            live.append("alive", style=f"bold {SUCCESS}")
+            live.append(f" (pid {liveness.pid})", style=DIM)
+        else:
+            live.append("monitor: ", style=DIM)
+            live.append("NOT running", style=f"bold {ATTN}")
+        self._w_liveness.update(live)
+
+        # Monospace table; thin-gray frame to match the cockpit aesthetic.
+        table = Table(
+            expand=False,
+            show_edge=True,
+            border_style=DIM,
+            header_style=f"bold {ACCENT}",
+            box=box.SIMPLE_HEAD,
+            padding=(0, 1),
+        )
+        table.add_column("#", justify="right", no_wrap=True)
+        table.add_column("PANE", no_wrap=True)
+        table.add_column("NAME", no_wrap=True, max_width=18)
+        table.add_column("DIR", no_wrap=True, max_width=20)
+        table.add_column("SESSION", no_wrap=True)
+        table.add_column("CONTEXT", justify="right", no_wrap=True)
+        table.add_column("STATE", no_wrap=True)
+
+        for serial, r in enumerate(rows, start=1):
+            ctx = f"{r.pct}%" if r.pct is not None else "—"
+            row_style = ATTN if r.is_error else None
+            table.add_row(
+                str(serial), r.pane, r.name[:18], r.dir[:20], r.session8,
+                ctx, r.state_label,
+                style=row_style,
+            )
+
+        if not rows:
+            self._w_table.update(Text("(no live sessions)", style=DIM))
+        else:
+            self._w_table.update(table)
+
+
 class KillConfirmScreen(ModalScreen):
     """Mandatory confirmation modal for the DESTRUCTIVE kill-session action.
 
@@ -537,7 +597,15 @@ class AgentsApp(App):
     CSS = f"""
     Screen {{ background: {BG}; }}
 
-    Header {{
+    /* Stats strip: docked to the RIGHT edge of the top row (height:1 keeps it
+       a single-row strip, not a vertical column) so it shares the SAME line as
+       the TabbedContent tab bar — left-aligned tabs ("Agents"/"Context") on
+       the left, stats flush right. Docking keeps it out of normal flow, so the
+       tab body still starts on the next row (no title row pushing it down). */
+    #topbar {{
+        dock: right;
+        layer: overlay;
+        width: auto;
         height: 1;
         padding: 0 1;
         background: {BG};
@@ -545,6 +613,26 @@ class AgentsApp(App):
     }}
 
     #body {{ height: 1fr; }}
+
+    /* Tabs: keep the cockpit's dark bg; let the tab panes fill the space. */
+    TabbedContent {{ height: 1fr; background: {BG}; }}
+    TabPane {{ padding: 0; background: {BG}; }}
+    Tabs {{ background: {BG}; }}
+    Tab {{ color: {DIM}; }}
+    Tabs:focus .-active {{ color: white; }}
+
+    #context {{
+        height: 1fr;
+        padding: 0 1;
+        border: round {DIM} 50%;
+        scrollbar-size-vertical: 1;
+        scrollbar-color: #9399b2;
+        scrollbar-color-hover: #b4befe;
+        scrollbar-color-active: #b4befe;
+        scrollbar-background: #181825;
+        scrollbar-background-hover: #181825;
+        scrollbar-background-active: #181825;
+    }}
 
     #left {{
         width: 48%;
@@ -647,6 +735,14 @@ class AgentsApp(App):
         # escape clears the filter; declared as a priority binding so it is
         # handled before any focused-widget default (which would swallow it).
         Binding("escape", "clear_filter", "clear", priority=True),
+        # Tab cycles between the Agents and Context tabs. A NON-PRINTABLE key on
+        # purpose: the Agents tab consumes plain letters into the type-to-filter,
+        # so a letter binding would be unreachable there. priority=True so it
+        # wins over Textual's default Tab focus-traversal AND fires regardless of
+        # which inner widget holds focus. Losing default Tab focus-traversal is
+        # fine here — the cockpit navigates via arrow keys + type-to-filter, not
+        # Tab focus. The tabs are also clickable (TabbedContent's built-in bar).
+        Binding("tab", "cycle_tab", "tabs", priority=True),
     ]
 
     agents: reactive[list] = reactive(list)
@@ -669,16 +765,25 @@ class AgentsApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(id="topbar")
-        with Horizontal(id="body"):
-            with Vertical(id="left"):
-                yield Static("agents", classes="panelabel")
-                with Horizontal(id="filterrow"):
-                    yield Static("❯ type to filter…", id="filter")
-                    yield Static("0/0", id="matchcount")
-                yield VerticalScroll(id="agentlist")
-            with Vertical(id="right"):
-                yield Static("preview", classes="panelabel")
-                yield PreviewPane(id="preview")
+        # TWO tabs: "Agents" (the existing two-pane view, behavior unchanged) and
+        # "Context" (the ctx-monitor mirror). Tabs are clickable; Tab cycles
+        # between them (a non-printable key so it never collides with the
+        # type-to-filter feature on the Agents tab — plain letters are consumed
+        # by the filter, so a letter binding would be unreachable there).
+        with TabbedContent(id="tabs"):
+            with TabPane("Agents", id="agents-tab"):
+                with Horizontal(id="body"):
+                    with Vertical(id="left"):
+                        yield Static("agents", classes="panelabel")
+                        with Horizontal(id="filterrow"):
+                            yield Static("❯ type to filter…", id="filter")
+                            yield Static("0/0", id="matchcount")
+                        yield VerticalScroll(id="agentlist")
+                    with Vertical(id="right"):
+                        yield Static("preview", classes="panelabel")
+                        yield PreviewPane(id="preview")
+            with TabPane("Context", id="context-tab"):
+                yield ContextPane(id="context")
         yield FooterBar()
 
     def on_mount(self) -> None:
@@ -712,6 +817,20 @@ class AgentsApp(App):
         attention = sum(1 for a in agents if a.state == "needs-input")
         self.query_one(Header).update_counts(total, working, attention)
         self._rebuild_list()
+        self._refresh_context(agents)
+
+    def _refresh_context(self, agents: list[Agent]) -> None:
+        """Update the Context tab from the SAME gathered agent list (no second
+        tmux/ps sweep) on every refresh tick. All file reads (monitor-state.json,
+        monitor.lock) live in data.py; this only hands prepared rows to the
+        widget."""
+        try:
+            pane = self.query_one("#context", ContextPane)
+        except Exception:
+            return  # not mounted yet
+        rows = data.gather_context_rows(agents)
+        liveness = data.monitor_liveness()
+        pane.update_rows(rows, liveness)
 
     # ---- filtering ----
 
@@ -1018,6 +1137,44 @@ class AgentsApp(App):
         self._update_filter_display()
         self._rebuild_list()
 
+    # ---- tab switching ----
+
+    def _active_tab(self) -> str:
+        """Id of the currently-active TabPane ('agents-tab' / 'context-tab').
+
+        Defaults to 'agents-tab' before the TabbedContent has mounted (so early
+        key events behave as the Agents tab)."""
+        try:
+            return self.query_one("#tabs", TabbedContent).active or "agents-tab"
+        except Exception:
+            return "agents-tab"
+
+    def action_cycle_tab(self) -> None:
+        """Tab: cycle to the NEXT tab, wrapping (so it still works if a 3rd tab
+        is ever added).
+
+        GUARD: when the DESTRUCTIVE kill-confirm modal is open, Tab must NOT
+        switch the underlying tabs. App priority bindings are checked before the
+        focused ModalScreen's handlers (same reason `escape` defers to the modal
+        in action_clear_filter), so we no-op here while that modal is on the
+        stack and let the keystroke stay within the modal.
+        """
+        if isinstance(self.screen, KillConfirmScreen):
+            return
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return
+        # Cycle through the TabPane ids in declared order, wrapping.
+        pane_ids = [p.id for p in tabs.query(TabPane) if p.id]
+        if not pane_ids:
+            return
+        try:
+            i = pane_ids.index(tabs.active)
+        except ValueError:
+            i = 0
+        tabs.active = pane_ids[(i + 1) % len(pane_ids)]
+
     # ---- kill-session flow (DESTRUCTIVE — confirm modal is non-negotiable) ----
 
     def _request_kill_selected(self) -> None:
@@ -1108,6 +1265,13 @@ class AgentsApp(App):
 
     def on_key(self, event) -> None:
         key = event.key
+        # On the CONTEXT tab the Agents-tab nav/filter handling is disabled:
+        # Tab (cycle tabs), ctrl+c (quit), and escape are priority Bindings that
+        # fire independently; everything else (↑↓ scroll, etc.) falls through to
+        # default handling so the context pane scrolls normally and no keystroke
+        # leaks into the (hidden) Agents-tab filter.
+        if self._active_tab() != "agents-tab":
+            return
         if key == "down":
             self.action_move_down(); event.stop(); return
         if key == "up":
@@ -1181,6 +1345,7 @@ class FooterBar(Static):
             ("→", "next alert"),
             ("", "type filter"),
             ("esc", "clear"),
+            ("Tab", "tabs"),
             ("^c", "quit"),
         ]
         first = True
