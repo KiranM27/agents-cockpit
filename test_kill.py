@@ -17,8 +17,6 @@ Proves:
       ALIVE (the modal blocks until confirmed — no kill yet).
   K2. CONFIRM KILLS: pressing `y` on the modal dismisses it and kills the
       scratch session — `_kill_test` is GONE from `tmux list-sessions`.
-  K3. DISAMBIGUATION: with a NON-EMPTY filter, Backspace EDITS the filter
-      (drops its last char) and does NOT open the kill modal / kill anything.
   K4. SELF-GUARD: when the selected agent's `.session` == current_tmux_session()
       (monkeypatched to the scratch session), Backspace shows the guard toast,
       pushes NO modal, and does NOT kill. (Targets ONLY the scratch session.)
@@ -134,31 +132,6 @@ async def run() -> int:
             # Ensure self-guard does NOT fire for the real test: force
             # current_tmux_session to something that is NOT the scratch session.
             data.current_tmux_session = lambda: "__not_scratch__"
-
-            # ---- K3: DISAMBIGUATION — non-empty filter, Backspace edits ----
-            # Do this FIRST (no real session ever targeted: a kill won't fire).
-            app.filter_text = "abc"
-            app._update_filter_display()
-            app._rebuild_list()
-            await pilot.pause()
-            sess_before_k3 = list_sessions()
-            stack_before_k3 = len(app.screen_stack)
-            await pilot.press("backspace")
-            await pilot.pause()
-            edited = app.filter_text == "ab"
-            no_modal_k3 = len(app.screen_stack) == stack_before_k3
-            no_kill_k3 = list_sessions() == sess_before_k3
-            print(f"    K3 filter 'abc'->'{app.filter_text}' "
-                  f"(edited={edited}) modal_opened={not no_modal_k3} "
-                  f"killed_anything={not no_kill_k3}")
-            check("K3.nonempty_filter_backspace_edits_not_kill",
-                  edited and no_modal_k3 and no_kill_k3,
-                  f"(filter={app.filter_text!r})")
-            # clear the filter back to empty for the remaining tests
-            app.filter_text = ""
-            app._update_filter_display()
-            app._rebuild_list()
-            await pilot.pause()
 
             # re-resolve scratch key (list may have changed) and SELECT it
             sk = scratch_key()

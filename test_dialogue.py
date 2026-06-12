@@ -14,7 +14,6 @@ kinds + lengths + structural facts):
     A3. Turns are spaced (each rendered turn carries a trailing blank line).
 
   CHANGE B — LEFT CARDS title/subtitle:
-    B1. (retired) the /tag feature is gone; tag-title rendering no longer exists.
     B2. An Agent renders label as the title and NO empty subtitle
         line (exactly 2 content lines), no .tagged class.
     B3. SVG snapshot exported to /tmp/agents-tui-cards2.svg.
@@ -126,49 +125,24 @@ async def run() -> int:
             check("A3.turns_are_spaced", spaced,
                   f"(sample_ends_blank={sample.endswith(chr(10))})")
 
-            # ----- B: construct a tagged + untagged Agent and render -----
+            # ----- B: construct an untagged Agent and render -----
             lv = app.query_one("#agentlist", VerticalScroll)
-            tagged = Agent(
-                session="cc-demo-1627", session_id="sid-tagged",
-                project="lexi-backend", task="checkpoint-rollback",
-                state="working",
-                age_seconds=42,
-                snippet="Refactoring the pane pooling so identity persists",
-                effort="high", pct=37, five_h_pct=58.0)
             untagged = Agent(
                 session="cc-demo-9", session_id="sid-untagged",
                 project="lexi-web", task="feature/foo", state="idle",
                 age_seconds=3600, snippet="Idle status snippet",
                 effort="low", pct=12, five_h_pct=4.0)
-            rt = AgentRow(tagged, False)
             ru = AgentRow(untagged, False)
-            lv.mount(rt, ru)
+            lv.mount(ru)
             await pilot.pause()
 
-            t_lines = rt.render().plain.split("\n")
             u_lines = ru.render().plain.split("\n")
 
             print("\n===== CHANGE B: card title/subtitle proof =====")
-            print(f"  TAGGED   classes={sorted(rt.classes)} "
-                  f"outer_h={rt.outer_size.height} lines={len(t_lines)}")
-            for ln in t_lines:
-                print(f"    | {ln}")
             print(f"  UNTAGGED classes={sorted(ru.classes)} "
                   f"outer_h={ru.outer_size.height} lines={len(u_lines)}")
             for ln in u_lines:
                 print(f"    | {ln}")
-
-            tag_title_ok = (
-                t_lines[0].lstrip("⋮○● ").startswith(
-                    "checkpoint-rollback-1627")
-                and "lexi-backend · checkpoint-rollback" in t_lines[1]
-                and len(t_lines) == 3
-                and "tagged" in rt.classes
-                and rt.outer_size.height == 5)
-            check("B1.tagged_title_is_tagname_subtitle_is_label",
-                  tag_title_ok,
-                  f"(lines={len(t_lines)} tagged={'tagged' in rt.classes} "
-                  f"h={rt.outer_size.height})")
 
             untag_ok = (
                 "lexi-web · feature/foo" in u_lines[0]
