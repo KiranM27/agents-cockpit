@@ -96,6 +96,51 @@ def _pct_str(pct) -> str:
         return "—"
 
 
+def _truncate(text: str, width: int) -> str:
+    """Clip `text` to `width` cells, appending a Unicode ellipsis when it would
+    overflow. A short string is returned untouched; `width <= 0` yields "".
+    Used for every Context-tab cell so long NAME/PROJECT values get `…` rather
+    than a hard cut (mirrors AgentRow's title/snippet ellipsis treatment)."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[: width - 1] + "…"
+
+
+# Context-tab column layout. PANE / SESSION / CTX% / STATE are short or fixed, so
+# they get compact fixed cells; NAME and PROJECT flex to fill the rest. We spread
+# the columns across ~80% of the available content width (leaving ~20% breathing
+# room on the right) and split the flex budget NAME-heavy. Computed from the live
+# render width so it tracks the terminal — see ContextRowWidget._columns().
+_CTX_PANE_W = 6        # "%NN"
+_CTX_SESSION_W = 8     # session8 is 8 chars
+_CTX_PCT_W = 5         # right-aligned "100%"
+_CTX_STATE_W = 10      # "need-input" / "watching"
+_CTX_GAPS = 5          # one space between each of the 6 columns
+_CTX_FILL = 0.80       # columns occupy up to ~80% of the width
+_CTX_NAME_SHARE = 0.6  # NAME takes ~60% of the NAME+PROJECT flex budget
+_CTX_NAME_MIN = 10
+_CTX_PROJECT_MIN = 8
+
+
+def _ctx_columns(width: int) -> tuple[int, int]:
+    """Return (name_w, project_w) for a Context row given the content `width`.
+
+    The fixed columns + gaps are constant; the flex budget = ~80% of width minus
+    those, split NAME-heavy. Falls back to sane minimums on a narrow terminal so
+    the columns never collapse to nothing."""
+    fixed = _CTX_PANE_W + _CTX_SESSION_W + _CTX_PCT_W + _CTX_STATE_W + _CTX_GAPS
+    flex = int(width * _CTX_FILL) - fixed
+    if flex < _CTX_NAME_MIN + _CTX_PROJECT_MIN:
+        return _CTX_NAME_MIN, _CTX_PROJECT_MIN
+    name_w = max(_CTX_NAME_MIN, int(flex * _CTX_NAME_SHARE))
+    project_w = max(_CTX_PROJECT_MIN, flex - name_w)
+    return name_w, project_w
+
+
 class Header(Static):
     """Top-right stats strip: live counts + clock, right-aligned, sharing the
     tab row."""
@@ -481,19 +526,46 @@ class ContextRowWidget(Static):
         r = self.row
         if r is None:
             return Text("")
-        # Column widths mirror the monitor's render_lines(): PANE 6, NAME 18,
-        # DIR 20, SESSION 10, CONTEXT right-aligned, then STATE.
-        pane = (r.pane or "-")[:6]
-        name = (r.name or "-")[:18]
-        dir_ = (r.dir or "-")[:20]
-        sess = (r.session8 or "-")[:10]
+        # Responsive columns: PANE / SESSION / CTX% / STATE are compact fixed
+        # cells; NAME and PROJECT flex with the terminal. self.size.width is the
+        # CONTENT width (inside border+padding), so the layout tracks the live
+        # render width (mirrors AgentRow). Every cell is ellipsis-truncated via
+        # _truncate so long NAME/PROJECT values get `…` instead of a hard cut.
+        width = max(self.size.width, 20)
+        name_w, project_w = _ctx_columns(width)
+        pane = _truncate(r.pane or "-", _CTX_PANE_W)
+        name = _truncate(r.name or "-", name_w)
+        dir_ = _truncate(r.dir or "-", project_w)
+        sess = _truncate(r.session8 or "-", _CTX_SESSION_W)
         ctx = f"{r.pct}%" if r.pct is not None else "—"
-        line = "{:<6} {:<18} {:<20} {:<10} {:>5}  {}".format(
-            pane, name, dir_, sess, ctx, r.state_label
+        line = "{:<{pw}} {:<{nw}} {:<{dw}} {:<{sw}} {:>{cw}} {}".format(
+            pane, name, dir_, sess, ctx, r.state_label,
+            pw=_CTX_PANE_W, nw=name_w, dw=project_w,
+            sw=_CTX_SESSION_W, cw=_CTX_PCT_W,
         )
         if r.is_error:
             return Text(line, style=f"bold {ATTN}")
         return Text(line, style=BRIGHT)
+
+
+class ContextHeaderWidget(Static):
+    """The single column-header row above the Context cards. Uses the SAME
+    `_ctx_columns` math and fixed cell widths as ContextRowWidget so the labels
+    line up exactly with the data cells. Styled dim+bold like the dashboard
+    headings. Width tracks the terminal via self.size.width (CONTENT width — the
+    CSS reserves a transparent border + padding matching the cards so the inset,
+    and therefore every column's x-position, is identical to the rows below)."""
+
+    # layout=True so a terminal resize re-renders against the new width.
+    def render(self) -> Text:  # type: ignore[override]
+        width = max(self.size.width, 20)
+        name_w, project_w = _ctx_columns(width)
+        line = "{:<{pw}} {:<{nw}} {:<{dw}} {:<{sw}} {:>{cw}} {}".format(
+            "PANE", "NAME", "PROJECT", "SESSION", "CTX%", "STATE",
+            pw=_CTX_PANE_W, nw=name_w, dw=project_w,
+            sw=_CTX_SESSION_W, cw=_CTX_PCT_W,
+        )
+        return Text(line, style=f"bold {DIM}")
 
 
 class ContextPane(VerticalScroll):
@@ -514,15 +586,20 @@ class ContextPane(VerticalScroll):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._w_liveness: Static | None = None
+        self._w_header: ContextHeaderWidget | None = None
         # key -> stable ContextRowWidget; ordered keys for the diff.
         self._row_widgets: dict[str, ContextRowWidget] = {}
         self._ordered_keys: list[str] = []
 
     def _ensure_liveness(self) -> None:
-        if self._w_liveness is not None:
-            return
-        self._w_liveness = Static()
-        self.mount(self._w_liveness)
+        # Persistent non-row chrome, mounted once in order: liveness line, then
+        # the column header. Data rows are moved to sit AFTER the header.
+        if self._w_liveness is None:
+            self._w_liveness = Static()
+            self.mount(self._w_liveness)
+        if self._w_header is None:
+            self._w_header = ContextHeaderWidget()
+            self.mount(self._w_header)
 
     @staticmethod
     def _row_key(r) -> str:
@@ -576,8 +653,9 @@ class ContextPane(VerticalScroll):
                 for key in desired_keys:
                     w = self._row_widgets[key]
                     if prev is None:
-                        # place after the liveness Static (first child)
-                        self.move_child(w, after=self._w_liveness)
+                        # place after the header (which follows the liveness
+                        # Static), so rows always sit below the column labels
+                        self.move_child(w, after=self._w_header)
                     else:
                         self.move_child(w, after=prev)
                     prev = w
@@ -1071,6 +1149,18 @@ class AgentsApp(App):
         background: {SELBG};
         border: round {ATTN};
         border-left: thick {ATTN};
+    }}
+
+    /* Column header above the Context cards. It reserves a TRANSPARENT (BG)
+       round border + the same `padding: 0 1` as ContextRowWidget so its left
+       inset — and therefore every column's x-position — matches the data cells
+       below it exactly, while remaining visually borderless. height 1 (single
+       line) + 2 border rows -> 3, sitting flush above the first card. */
+    ContextHeaderWidget {{
+        height: 3;
+        padding: 0 1;
+        border: round {BG};
+        overflow: hidden;
     }}
 
     #left {{
@@ -1780,7 +1870,19 @@ class AgentsApp(App):
                 timeout=3)
             return
         if not wid:
-            self.notify("no window mapping yet — attach it once", timeout=3)
+            name = a.pane_title or a.label
+            def _on_decision(proceed: bool) -> None:
+                if not proceed:
+                    return
+                ok, msg = data.attach_session_window(a.session)
+                self.notify(msg, severity=("information" if ok else "error"), timeout=3)
+            self.push_screen(
+                ConfirmScreen(
+                    "Launch into a new window?",
+                    f"{name} has no open window. Re-attach its tmux session in a new Ghostty window?",
+                ),
+                _on_decision,
+            )
             return
         ok = data.focus_window(wid)
         if not ok:
