@@ -856,18 +856,28 @@ class AgentsApp(App):
         scrollbar-background-active: #181825;
     }}
 
-    /* Context-tab rows: one monospace line each. Selection band + accent/attn
-       left border mirror AgentRow.selected, scaled to a 1-line row. */
+    /* Context-tab rows: CARDS mirroring AgentRow so selecting highlights the
+       WHOLE card with ZERO geometry change. The base rule ALWAYS reserves a
+       rounded border (round border = +2 rows), so selection only swaps the
+       border COLOR — no reflow. One content line + 2 border rows -> FIXED
+       height 3. We avoid `height: auto` for the same reason as AgentRow: auto
+       re-measures and wraps the padded/aligned line, inflating the card.
+       Overflow hidden so a padded line can never spill/wrap visibly. */
     ContextRowWidget {{
-        height: 1;
+        height: 3;
         padding: 0 1;
+        margin: 0 0 1 0;
+        border: round {DIM} 40%;
+        overflow: hidden;
     }}
     ContextRowWidget.selected {{
         background: {SELBG};
+        border: round {ACCENT};
         border-left: thick {ACCENT};
     }}
     ContextRowWidget.selected-attn {{
         background: {SELBG};
+        border: round {ATTN};
         border-left: thick {ATTN};
     }}
 
