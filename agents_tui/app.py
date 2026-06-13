@@ -22,10 +22,8 @@ from __future__ import annotations
 import difflib
 from datetime import datetime
 
-from rich import box
 from rich.console import Group
 from rich.markdown import Markdown
-from rich.table import Table
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
@@ -455,33 +453,81 @@ class PreviewPane(VerticalScroll):
         return t
 
 
-class ContextPane(VerticalScroll):
-    """Context tab: a monospace table mirroring the ctx-monitor dashboard.
+class ContextRowWidget(Static):
+    """One Context-tab row = a single monospace line mirroring the monitor's
+    columns (PANE NAME DIR SESSION CONTEXT STATE — the cosmetic serial `#` is
+    dropped since it isn't known per-widget). Selection band via CSS class.
 
-    Columns match ctx-monitor.py's render_lines() EXACTLY: serial #, PANE, NAME,
-    DIR, SESSION (session8), CONTEXT (used %), STATE. A liveness line at the top
-    reports whether the monitor sidecar is running (from monitor.lock's PID).
-    ERROR rows render RED, mirroring the monitor. Rows are pre-sorted by CONTEXT
-    % descending in data.gather_context_rows(). Two persistent Statics (liveness
-    + table) updated in place — same no-remount discipline as PreviewPane.
+    `row` is a reactive `data.ContextRow` so an in-place reassignment on refresh
+    re-invokes render() WITHOUT remounting the widget (the flicker fix — mirrors
+    AgentRow). ERROR rows render RED, mirroring the monitor's ERROR tint.
+    """
+
+    # layout=True so a content reassignment re-renders + relayouts in place.
+    row: reactive = reactive(None, layout=True)
+
+    def __init__(self, row, selected: bool) -> None:
+        super().__init__()
+        self.set_reactive(ContextRowWidget.row, row)
+        self._selected = selected
+
+    def render(self) -> Text:  # type: ignore[override]
+        r = self.row
+        if r is None:
+            return Text("")
+        # Column widths mirror the monitor's render_lines(): PANE 6, NAME 18,
+        # DIR 20, SESSION 10, CONTEXT right-aligned, then STATE.
+        pane = (r.pane or "-")[:6]
+        name = (r.name or "-")[:18]
+        dir_ = (r.dir or "-")[:20]
+        sess = (r.session8 or "-")[:10]
+        ctx = f"{r.pct}%" if r.pct is not None else "—"
+        line = "{:<6} {:<18} {:<20} {:<10} {:>5}  {}".format(
+            pane, name, dir_, sess, ctx, r.state_label
+        )
+        if r.is_error:
+            return Text(line, style=f"bold {ATTN}")
+        return Text(line, style=BRIGHT)
+
+
+class ContextPane(VerticalScroll):
+    """Context tab: a per-row widget list mirroring the ctx-monitor dashboard.
+
+    Columns match ctx-monitor.py's render_lines(): PANE, NAME, DIR, SESSION
+    (session8), CONTEXT (used %), STATE (the cosmetic serial `#` is dropped). A
+    liveness line at the top reports whether the monitor sidecar is running
+    (from monitor.lock's PID). ERROR rows render RED, mirroring the monitor.
+    Rows arrive pre-sorted by CONTEXT % descending from gather_context_rows().
+
+    KEYED no-remount discipline (mirrors AgentsApp._sync_rows): the liveness
+    Static is the persistent first child; each ContextRow is a keyed
+    ContextRowWidget updated in place, with only the count/order DELTA
+    mounted/removed/moved on refresh.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._w_liveness: Static | None = None
-        self._w_table: Static | None = None
+        # key -> stable ContextRowWidget; ordered keys for the diff.
+        self._row_widgets: dict[str, ContextRowWidget] = {}
+        self._ordered_keys: list[str] = []
 
-    def _ensure_widgets(self) -> None:
+    def _ensure_liveness(self) -> None:
         if self._w_liveness is not None:
             return
         self._w_liveness = Static()
-        self._w_table = Static()
-        self.mount(self._w_liveness, self._w_table)
+        self.mount(self._w_liveness)
+
+    @staticmethod
+    def _row_key(r) -> str:
+        """Stable key for a ContextRow: prefer the raw sid, then session8, then
+        pane. Must match AgentsApp's _ctx_rows keying."""
+        return r.sid or r.session8 or r.pane or "-"
 
     def update_rows(self, rows: list, liveness) -> None:
-        """Re-render the liveness line + the table from prepared data (all
-        file-reading already done in data.py — this is pure presentation)."""
-        self._ensure_widgets()
+        """Re-render the liveness line + the per-row widgets from prepared data
+        (all file-reading already done in data.py — pure presentation)."""
+        self._ensure_liveness()
 
         live = Text()
         if liveness.alive:
@@ -493,36 +539,57 @@ class ContextPane(VerticalScroll):
             live.append("NOT running", style=f"bold {ATTN}")
         self._w_liveness.update(live)
 
-        # Monospace table; thin-gray frame to match the cockpit aesthetic.
-        table = Table(
-            expand=False,
-            show_edge=True,
-            border_style=DIM,
-            header_style=f"bold {ACCENT}",
-            box=box.SIMPLE_HEAD,
-            padding=(0, 1),
-        )
-        table.add_column("#", justify="right", no_wrap=True)
-        table.add_column("PANE", no_wrap=True)
-        table.add_column("NAME", no_wrap=True, max_width=18)
-        table.add_column("DIR", no_wrap=True, max_width=20)
-        table.add_column("SESSION", no_wrap=True)
-        table.add_column("CONTEXT", justify="right", no_wrap=True)
-        table.add_column("STATE", no_wrap=True)
+        desired_keys = [self._row_key(r) for r in rows]
+        by_key = {k: r for k, r in zip(desired_keys, rows)}
+        desired_set = set(desired_keys)
 
-        for serial, r in enumerate(rows, start=1):
-            ctx = f"{r.pct}%" if r.pct is not None else "—"
-            row_style = ATTN if r.is_error else None
-            table.add_row(
-                str(serial), r.pane, r.name[:18], r.dir[:20], r.session8,
-                ctx, r.state_label,
-                style=row_style,
-            )
+        # 1. remove vanished rows
+        for key in list(self._row_widgets):
+            if key not in desired_set:
+                self._row_widgets.pop(key).remove()
 
-        if not rows:
-            self._w_table.update(Text("(no live sessions)", style=DIM))
-        else:
-            self._w_table.update(table)
+        # 2. update existing rows in place; mount new ones (order fixed in 3).
+        for key in desired_keys:
+            r = by_key[key]
+            w = self._row_widgets.get(key)
+            if w is None:
+                w = ContextRowWidget(r, False)
+                self._row_widgets[key] = w
+                self.mount(w)
+            else:
+                w.row = r  # reactive(layout=True) -> in-place re-render
+
+        # 3. reorder mounted widgets WITHOUT remounting (liveness stays first).
+        try:
+            current = [c for c in self.children
+                       if isinstance(c, ContextRowWidget)]
+            current_keys = [self._row_key(c.row) for c in current
+                            if c.row is not None]
+            if current_keys != desired_keys:
+                prev = None
+                for key in desired_keys:
+                    w = self._row_widgets[key]
+                    if prev is None:
+                        # place after the liveness Static (first child)
+                        self.move_child(w, after=self._w_liveness)
+                    else:
+                        self.move_child(w, after=prev)
+                    prev = w
+        except Exception:
+            pass
+
+        self._ordered_keys = desired_keys
+
+    def set_row_state(self, key: str, state_label: str, is_error: bool) -> None:
+        """Optimistically repaint a single row's displayed state (instant
+        feedback after a reset, before the next refresh re-reads ground truth).
+        Mutates the dataclass in place (not frozen) and refreshes the widget."""
+        w = self._row_widgets.get(key)
+        if w is None or w.row is None:
+            return
+        w.row.state_label = state_label
+        w.row.is_error = is_error
+        w.refresh(layout=True)
 
 
 class KillConfirmScreen(ModalScreen):
@@ -592,6 +659,56 @@ class KillConfirmScreen(ModalScreen):
             return
         # Belt-and-suspenders: swallow EVERY other key so nothing leaks to the
         # app behind the modal and so a stray Enter can never confirm.
+        event.stop()
+
+
+class ConfirmScreen(ModalScreen):
+    """Generic yes/no confirm modal (NON-destructive — ACCENT border, not the
+    red kill border). Models KillConfirmScreen's key discipline: `y` confirms,
+    `n` cancels (both priority bindings), `escape` is routed via the App's
+    priority escape binding, and every other key is swallowed so nothing leaks
+    to the background and a stray Enter can never confirm. Default is CANCEL.
+
+    Returns (via dismiss) True to proceed, False to cancel.
+    """
+
+    BINDINGS = [
+        Binding("y", "confirm", "yes", priority=True),
+        Binding("n", "cancel", "cancel", priority=True),
+    ]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        body = Text()
+        body.append(self._title, style=f"bold {ACCENT}")
+        body.append("\n\n")
+        body.append(self._body, style=BRIGHT)
+        body.append("\n\n")
+        body.append(" [y] yes ", style=f"bold {BG} on {ACCENT}")
+        body.append("    ", style=DIM)
+        body.append("[n / esc] cancel", style=DIM)
+        with Vertical(id="confirmdialog"):
+            yield Static(body, id="confirmbody")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def on_key(self, event) -> None:
+        # `escape` cancel is routed via the App's priority escape binding
+        # (action_clear_filter), checked before this screen's on_key — let it
+        # pass (don't double-dismiss). y / n fire via the priority bindings.
+        if event.key == "escape":
+            return
+        if event.key in ("y", "n"):
+            return
+        # Swallow everything else so nothing leaks to the app behind the modal.
         event.stop()
 
 
@@ -739,6 +856,21 @@ class AgentsApp(App):
         scrollbar-background-active: #181825;
     }}
 
+    /* Context-tab rows: one monospace line each. Selection band + accent/attn
+       left border mirror AgentRow.selected, scaled to a 1-line row. */
+    ContextRowWidget {{
+        height: 1;
+        padding: 0 1;
+    }}
+    ContextRowWidget.selected {{
+        background: {SELBG};
+        border-left: thick {ACCENT};
+    }}
+    ContextRowWidget.selected-attn {{
+        background: {SELBG};
+        border-left: thick {ATTN};
+    }}
+
     #left {{
         width: 48%;
         border: round {DIM} 50%;
@@ -875,6 +1007,23 @@ class AgentsApp(App):
     }}
     #replyhint {{ width: 1fr; height: 1; }}
 
+    /* Generic CONFIRM modal: dim backdrop, centered card with an ACCENT (blue)
+       border — this is a NON-destructive action (clearing a monitor error). */
+    ConfirmScreen {{
+        align: center middle;
+        background: $background 60%;
+    }}
+    #confirmdialog {{
+        width: 64;
+        height: auto;
+        max-width: 80%;
+        padding: 1 2;
+        background: {BG};
+        border: round {ACCENT};
+        border-title-color: {ACCENT};
+    }}
+    #confirmbody {{ width: 1fr; height: auto; }}
+
     Footer {{
         height: 1;
         background: {BG};
@@ -916,6 +1065,12 @@ class AgentsApp(App):
         # sync so they never disturb the keyed reorder (which filters to
         # AgentRow instances).
         self._headers: dict[str, Static] = {}   # section-state -> header Static
+        # Context-tab selection (SEPARATE from the Agents-tab machinery, which is
+        # typed to Agent). Keyed on the ContextRow key (sid -> session8 -> pane).
+        self._ctx_selected_key: str | None = None
+        # Last gathered ContextRows, stashed by _refresh_context so the Context
+        # tab's movement/Enter logic reads them without re-gathering.
+        self._ctx_rows: list = []
 
     # ---- compose ----
 
@@ -988,6 +1143,113 @@ class AgentsApp(App):
         rows = data.gather_context_rows(agents)
         liveness = data.monitor_liveness()
         pane.update_rows(rows, liveness)
+        # Stash rows so movement/Enter logic reads them without re-gathering.
+        self._ctx_rows = rows
+        # Default / repair selection: keep it on the same row across refreshes;
+        # otherwise prefer the FIRST error row, else the first row.
+        keys = [self._ctx_key(r) for r in rows]
+        if self._ctx_selected_key not in keys:
+            err_keys = [self._ctx_key(r) for r in rows if r.is_error]
+            if err_keys:
+                self._ctx_selected_key = err_keys[0]
+            elif keys:
+                self._ctx_selected_key = keys[0]
+            else:
+                self._ctx_selected_key = None
+        self._refresh_ctx_selection_classes()
+
+    @staticmethod
+    def _ctx_key(r) -> str:
+        """Stable key for a ContextRow: sid -> session8 -> pane. MUST match
+        ContextPane._row_key so the app's selection lines up with the widgets."""
+        return r.sid or r.session8 or r.pane or "-"
+
+    def _refresh_ctx_selection_classes(self) -> None:
+        """Toggle the .selected / .selected-attn class on the Context row widgets
+        (mirrors _refresh_selection_classes for the Agents tab)."""
+        try:
+            pane = self.query_one("#context", ContextPane)
+        except Exception:
+            return
+        for key, w in pane._row_widgets.items():
+            if w.row is None:
+                continue
+            sel = key == self._ctx_selected_key
+            w.remove_class("selected")
+            w.remove_class("selected-attn")
+            if sel:
+                w.add_class("selected-attn" if w.row.is_error else "selected")
+
+    def _ctx_move(self, delta: int) -> None:
+        """Move the Context-tab selection by delta (wraps); mirror _move."""
+        if not self._ctx_rows:
+            return
+        keys = [self._ctx_key(r) for r in self._ctx_rows]
+        try:
+            i = keys.index(self._ctx_selected_key)
+        except ValueError:
+            i = 0
+        i = (i + delta) % len(keys)
+        self._ctx_selected_key = keys[i]
+        self._refresh_ctx_selection_classes()
+        self._scroll_to_ctx_selected()
+
+    def _scroll_to_ctx_selected(self) -> None:
+        """Bring the selected Context row into view if off-screen (best-effort)."""
+        key = self._ctx_selected_key
+        if key is None:
+            return
+        try:
+            pane = self.query_one("#context", ContextPane)
+            w = pane._row_widgets.get(key)
+            if w is not None:
+                pane.scroll_to_widget(w, animate=False)
+        except Exception:
+            pass
+
+    def _ctx_enter(self) -> None:
+        """Enter on the selected Context row: if it's in ERROR, confirm + clear
+        the monitor error (re-arm the watcher) via a per-sid reset flag the
+        daemon picks up. NON-destructive — does NOT touch the live session."""
+        row = None
+        for r in self._ctx_rows:
+            if self._ctx_key(r) == self._ctx_selected_key:
+                row = r
+                break
+        if row is None:
+            return
+        if not row.is_error:
+            self.notify("session is not in error", timeout=2)
+            return
+        sel_key = self._ctx_selected_key
+        title = "Clear monitor error"
+        body = (f"Re-arm the context watcher for {row.name}? Clears the "
+                "monitor's error state — does NOT touch the running session.  "
+                "(y / n)")
+
+        def _on_decision(confirmed: bool | None) -> None:
+            if confirmed is not True:
+                return
+            sid = row.sid
+            if not sid:
+                self.notify("no session id for this row", severity="error")
+                return
+            ok, msg = data.request_state_reset(sid)
+            self.notify(msg, severity=("information" if ok else "error"),
+                        timeout=3)
+            if ok:
+                # Optimistic instant feedback; the next refresh re-reads
+                # monitor-state.json as ground truth.
+                try:
+                    pane = self.query_one("#context", ContextPane)
+                    pane.set_row_state(sel_key, "watching", False)
+                except Exception:
+                    pass
+                row.state_label = "watching"
+                row.is_error = False
+                self._refresh_ctx_selection_classes()
+
+        self.push_screen(ConfirmScreen(title, body), _on_decision)
 
     # ---- filtering ----
 
@@ -1167,7 +1429,7 @@ class AgentsApp(App):
         `escape` is the one exception NOT blanket-guarded: it reaches the App's
         priority `escape` binding (action_clear_filter), which dismisses the
         active modal — so Esc still cancels both modals."""
-        return isinstance(self.screen, (ReplyScreen, KillConfirmScreen))
+        return isinstance(self.screen, (ReplyScreen, KillConfirmScreen, ConfirmScreen))
 
     # ---- selection movement ----
 
@@ -1314,6 +1576,10 @@ class AgentsApp(App):
             return
         # 2. reply modal open -> escape CANCELS the modal (without sending).
         if isinstance(self.screen, ReplyScreen):
+            self.screen.dismiss(False)
+            return
+        # 2b. generic confirm modal open -> escape CANCELS it.
+        if isinstance(self.screen, ConfirmScreen):
             self.screen.dismiss(False)
             return
         # 3. filter mode -> escape CANCELS the filter (clears + back to command).
@@ -1548,11 +1814,16 @@ class AgentsApp(App):
             if key == "escape":
                 self._exit_filter_mode(keep=False); event.stop(); return
             return  # let the Input handle the keystroke
-        # On the CONTEXT tab the Agents-tab command handling is disabled:
-        # Tab (cycle tabs), ctrl+c (quit), and escape are priority Bindings that
-        # fire independently; everything else (↑↓ scroll, etc.) falls through to
-        # default handling so the context pane scrolls normally.
+        # On the CONTEXT tab we handle arrow selection + Enter (clear monitor
+        # error), and let everything else fall through so the pane still scrolls
+        # and the priority Bindings (Tab/ctrl+c/escape) fire independently.
         if self._active_tab() != "agents-tab":
+            if key == "down":
+                self._ctx_move(1); event.stop(); return
+            if key == "up":
+                self._ctx_move(-1); event.stop(); return
+            if key == "enter":
+                self._ctx_enter(); event.stop(); return
             return
         # COMMAND MODE. Plain letters are NO LONGER a filter.
         if key == "down":

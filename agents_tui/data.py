@@ -172,6 +172,7 @@ class ContextRow:
     pct: Optional[int]         # ctx used %
     state_label: str           # human-readable STATE
     is_error: bool             # True -> render the row RED
+    sid: Optional[str] = None  # raw Claude session id (for the reset-flag join)
 
 
 @dataclass
@@ -1158,6 +1159,41 @@ def load_monitor_states_by_sid() -> dict[str, str]:
     return out
 
 
+def request_state_reset(sid: str) -> tuple[bool, str]:
+    """Ask the ctx-monitor daemon to clear a session's monitor ERROR by writing
+    a per-sid reset flag the daemon watches and re-arms on.
+
+    Mechanism (STDLIB ONLY — no tmux, no send_message_to_pane, no live-session
+    touch): atomically create `<CTX_DIR>/reset-<sid>.flag` by writing a unique
+    temp file in the same dir then os.replace()-ing it onto the final path. The
+    daemon's _handle_reset_flags() picks it up on its next tick, transitions the
+    matching pane ERROR -> ARMED, and deletes the flag. This clears ONLY the
+    daemon's bookkeeping — the running Claude session is never compacted/cleared.
+
+    Returns (True, msg) on success, (False, msg) on a missing sid or OSError.
+    """
+    if not sid:
+        return (False, "no session id")
+    # Defense-in-depth: sids are Claude UUIDs, but never let one path-escape
+    # CTX_DIR via the flag filename. Strip any dir component and reject the
+    # result if it's empty or still carries a path separator.
+    sid = os.path.basename(sid)
+    if not sid or os.sep in sid or (os.altsep and os.altsep in sid):
+        return (False, "invalid sid")
+    try:
+        os.makedirs(CTX_DIR, exist_ok=True)
+        final = os.path.join(CTX_DIR, "reset-{}.flag".format(sid))
+        tmp = os.path.join(
+            CTX_DIR, "reset-{}.flag.tmp.{}".format(sid, os.getpid())
+        )
+        with open(tmp, "w") as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+        os.replace(tmp, final)
+    except OSError as e:
+        return (False, "reset failed: {}".format(e))
+    return (True, "monitor error cleared — re-arming watcher")
+
+
 def monitor_liveness() -> MonitorLiveness:
     """Read monitor.lock's stamped PID and test it with os.kill(pid, 0).
 
@@ -1215,6 +1251,7 @@ def gather_context_rows(agents: Optional[list[Agent]] = None) -> list[ContextRow
             pct=a.pct,
             state_label=MONITOR_STATE_LABELS.get(raw_state, raw_state),
             is_error=(raw_state == "ERROR"),
+            sid=a.session_id,
         ))
 
     # Sort by CONTEXT % DESCENDING (highest first). Rows with no ctx% sink to the
