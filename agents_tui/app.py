@@ -1466,6 +1466,12 @@ class AgentsApp(App):
         # fine here — the cockpit navigates via arrow keys + type-to-filter, not
         # Tab focus. The tabs are also clickable (TabbedContent's built-in bar).
         Binding("tab", "cycle_tab", "tabs", priority=True),
+        # ←/→ cycle tabs too (right=next, left=prev), matching Tab. priority=True
+        # so they win over ContentTabs' built-in arrow nav (which would otherwise
+        # double-advance) and fire regardless of which tab/widget holds focus —
+        # the user can always get back to the Agents tab.
+        Binding("right", "cycle_tab(1)", "tabs", priority=True),
+        Binding("left", "cycle_tab_prev", "tabs", priority=True),
     ]
 
     agents: reactive[list] = reactive(list)
@@ -1933,7 +1939,8 @@ class AgentsApp(App):
         self._move(-1)
 
     def action_next_alert(self) -> None:
-        """→ : jump selection to the next needs-input agent (wrap)."""
+        """Jump selection to the next needs-input agent (wrap). Currently UNBOUND
+        — → now cycles tabs (see BINDINGS); kept for possible future rebinding."""
         if self._modal_active():
             return
         needy = [a for a in self._filtered if a.state == "needs-input"]
@@ -2047,9 +2054,10 @@ class AgentsApp(App):
         except Exception:
             return "agents-tab"
 
-    def action_cycle_tab(self) -> None:
-        """Tab: cycle to the NEXT tab, wrapping (so it still works if a 3rd tab
-        is ever added).
+    def action_cycle_tab(self, direction: int = 1) -> None:
+        """Tab / →: cycle to the NEXT tab; ← cycles to the PREVIOUS tab. Always
+        wraps (so it still works if a 3rd tab is ever added) and works from
+        either tab so the user can always get back.
 
         GUARD: when the DESTRUCTIVE kill-confirm modal is open, Tab must NOT
         switch the underlying tabs. App priority bindings are checked before the
@@ -2074,7 +2082,12 @@ class AgentsApp(App):
             i = pane_ids.index(tabs.active)
         except ValueError:
             i = 0
-        tabs.active = pane_ids[(i + 1) % len(pane_ids)]
+        tabs.active = pane_ids[(i + direction) % len(pane_ids)]
+
+    def action_cycle_tab_prev(self) -> None:
+        """← : cycle to the PREVIOUS tab (thin wrapper for the left-arrow
+        binding; see action_cycle_tab)."""
+        self.action_cycle_tab(-1)
 
     # ---- kill-session flow (DESTRUCTIVE — confirm modal is non-negotiable) ----
 
@@ -2333,8 +2346,9 @@ class AgentsApp(App):
             self.action_move_down(); event.stop(); return
         if key == "up":
             self.action_move_up(); event.stop(); return
-        if key == "right":
-            self.action_next_alert(); event.stop(); return
+        # ←/→ now cycle tabs via priority Bindings (see BINDINGS). action_next_alert
+        # is left defined but currently UNBOUND in case the jump-to-alert behaviour
+        # is wanted again later.
         if key == "enter":
             self.action_open_window(); event.stop(); return
         if key == "slash":
