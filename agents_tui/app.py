@@ -2404,12 +2404,12 @@ class FooterBar(Static):
         t = Text()
         chips = [
             ("↿⇂", "move"),
+            ("⏎", "open"),
+            ("←/→", "tabs"),
             ("r", "reply"),
             ("m", "move section"),
+            ("n", "new window"),
             ("/", "filter"),
-            ("⏎", "open"),
-            ("→", "next alert"),
-            ("Tab", "tab"),
             ("⌫", "kill"),
             ("^c", "quit"),
         ]
