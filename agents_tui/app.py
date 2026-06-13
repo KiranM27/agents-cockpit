@@ -1466,12 +1466,9 @@ class AgentsApp(App):
         # fine here — the cockpit navigates via arrow keys + type-to-filter, not
         # Tab focus. The tabs are also clickable (TabbedContent's built-in bar).
         Binding("tab", "cycle_tab", "tabs", priority=True),
-        # ←/→ cycle tabs too (right=next, left=prev), matching Tab. priority=True
-        # so they win over ContentTabs' built-in arrow nav (which would otherwise
-        # double-advance) and fire regardless of which tab/widget holds focus —
-        # the user can always get back to the Agents tab.
-        Binding("right", "cycle_tab(1)", "tabs", priority=True),
-        Binding("left", "cycle_tab_prev", "tabs", priority=True),
+        # ←/→ also cycle tabs (right=next, left=prev), but are handled in on_key
+        # (NON-priority) so they don't swallow horizontal cursor movement inside
+        # text inputs (filter Input, reply TextArea, name/dir pickers). See on_key.
     ]
 
     agents: reactive[list] = reactive(list)
@@ -2084,11 +2081,6 @@ class AgentsApp(App):
             i = 0
         tabs.active = pane_ids[(i + direction) % len(pane_ids)]
 
-    def action_cycle_tab_prev(self) -> None:
-        """← : cycle to the PREVIOUS tab (thin wrapper for the left-arrow
-        binding; see action_cycle_tab)."""
-        self.action_cycle_tab(-1)
-
     # ---- kill-session flow (DESTRUCTIVE — confirm modal is non-negotiable) ----
 
     def _request_kill_selected(self) -> None:
@@ -2330,6 +2322,16 @@ class AgentsApp(App):
             if key == "escape":
                 self._exit_filter_mode(keep=False); event.stop(); return
             return  # let the Input handle the keystroke
+        # ←/→ cycle tabs (right=next, left=prev), matching Tab. Handled HERE
+        # (NON-priority, AFTER the modal + filter guards above) so they NEVER
+        # swallow horizontal cursor movement inside text inputs — those are all
+        # either the filter Input (guard above) or inside ModalScreens (guard
+        # above). Placed before the Context-tab branch so it works from BOTH
+        # tabs and regardless of which widget holds focus.
+        if key == "right":
+            self.action_cycle_tab(1); event.stop(); return
+        if key == "left":
+            self.action_cycle_tab(-1); event.stop(); return
         # On the CONTEXT tab we handle arrow selection + Enter (clear monitor
         # error), and let everything else fall through so the pane still scrolls
         # and the priority Bindings (Tab/ctrl+c/escape) fire independently.
@@ -2346,9 +2348,9 @@ class AgentsApp(App):
             self.action_move_down(); event.stop(); return
         if key == "up":
             self.action_move_up(); event.stop(); return
-        # ←/→ now cycle tabs via priority Bindings (see BINDINGS). action_next_alert
-        # is left defined but currently UNBOUND in case the jump-to-alert behaviour
-        # is wanted again later.
+        # ←/→ cycle tabs and are handled above (before the Context-tab branch).
+        # action_next_alert is left defined but currently UNBOUND in case the
+        # jump-to-alert behaviour is wanted again later.
         if key == "enter":
             self.action_open_window(); event.stop(); return
         if key == "slash":
