@@ -117,6 +117,8 @@ class Agent:
     cwd: str = ""                      # abs path
     pct: Optional[int] = None          # ctx % (shown regardless of age)
     state: str = "idle"                # "needs-input" | "working" | "idle"
+    live_state: str = "idle"           # auto-classified state, ignoring any manual override
+    pinned: bool = False               # True when a manual override is forcing `state`
     attached: bool = False             # True if a tmux client has an open window
     active: bool = False               # working/needy/attached/recently-used
     age_seconds: Optional[float] = None
@@ -563,6 +565,22 @@ _list_cache: dict[str, tuple[float, dict]] = {}
 # pane title while generating).
 _prev_raw_title: dict[str, str] = {}        # session -> last raw pane title
 _last_title_change: dict[str, float] = {}   # session -> ts of last title change
+
+# Manual section overrides (in-memory only — never persisted). Maps a stable
+# per-session key (session_id preferred, tmux name fallback — matches app's
+# _key()) to (target_section, t0). An override pins the row to `target` until
+# the session shows NEW activity (title change or new transcript ts) past t0,
+# at which point gather_agents auto-clears it and reverts to live classification.
+_section_overrides: dict[str, tuple[str, float]] = {}  # key -> (target_section, t0)
+
+
+def set_section_override(key: str, target: str) -> None:
+    """Pin a session to `target` section until new activity. Stamps t0=now."""
+    _section_overrides[key] = (target, time.time())
+
+
+def clear_section_override(key: str) -> None:
+    _section_overrides.pop(key, None)
 
 
 def find_transcript(session_id: Optional[str]) -> Optional[str]:
@@ -1061,14 +1079,34 @@ def gather_agents() -> list[Agent]:
         else:
             age = None
 
-        # state: needy wins; else "working" if the raw pane title is animating
-        # (see working detection above); else idle. (age no longer drives state.)
+        # live (auto) classification — needy wins; else "working" if the raw pane
+        # title is animating (see working detection above); else idle. (age no
+        # longer drives state.) Stored into live_state so a manual override can
+        # be layered on top without losing what the classifier actually thinks.
         if needy:
-            state = "needs-input"
+            live_state = "needs-input"
         elif working:
-            state = "working"
+            live_state = "working"
         else:
-            state = "idle"
+            live_state = "idle"
+
+        # Manual section override: pin to `target` until NEW activity since the
+        # move (a title change or a newer transcript ts past t0) auto-clears it.
+        key = session_id or sess        # match app's _key(): id preferred, tmux name fallback
+        ov = _section_overrides.get(key)
+        if ov is not None:
+            target, t0 = ov
+            last_activity = max(_last_title_change.get(sess, 0.0), (last_ts or 0.0))
+            if last_activity > t0:
+                _section_overrides.pop(key, None)   # NEW activity -> revert to live
+                state = live_state
+                pinned = False
+            else:
+                state = target
+                pinned = True
+        else:
+            state = live_state
+            pinned = False
 
         # active vs inactive (the cleanup-candidate split): a session is active
         # if it's working or waiting on Kiran OR has an open window OR was used
@@ -1091,6 +1129,8 @@ def gather_agents() -> list[Agent]:
             cwd=cwd,
             pct=pct,
             state=state,
+            live_state=live_state,
+            pinned=pinned,
             attached=attached,
             active=active,
             age_seconds=age,

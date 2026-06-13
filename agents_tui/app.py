@@ -262,6 +262,11 @@ class AgentRow(Static):
         age = a.age_str
         cluster1 = Text()
         ctx = f"{a.pct}%" if a.pct is not None else "—"
+        # Pinned (manual section override) marker — a subtle DIM glyph leading the
+        # right cluster. cluster1.cell_len is reserved before the title budget +
+        # gap math below, so this adds NO height and shifts no layout.
+        if a.pinned:
+            cluster1.append("⇄ ", style=DIM)
         cluster1.append(f"ctx {ctx}", style=DIM)
         cluster1.append(" · ", style=DIM)
         if a.effort:
@@ -1119,6 +1124,66 @@ class ModelPickerScreen(ModalScreen):
         elif key == "escape":
             return  # let App's priority escape binding dismiss
 
+
+class SectionPickerScreen(ModalScreen):
+    """Manually MOVE the selected session to another section (an override).
+
+    Dismisses with the chosen section key, or None on cancel. The option that
+    matches the live (auto) classification is annotated `← auto` — picking it
+    clears the override so the row reverts to live classification.
+    """
+
+    def __init__(self, current: str, live: str) -> None:
+        super().__init__()
+        self._current = current
+        self._live = live
+        self._sel = SECTION_ORDER.index(current) if current in SECTION_ORDER else 0
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("Move to section", style=f"bold {ACCENT}")
+        hint = Text("↑/↓ move · ⏎ move · esc cancel", style=DIM)
+        with Vertical(id="sectiondialog"):
+            yield Static(header, id="sectionheader")
+            yield Static("", id="sectionresults")
+            yield Static(hint, id="sectionhint")
+
+    def on_mount(self) -> None:
+        self._render_results()
+
+    def _render_results(self) -> None:
+        t = Text()
+        for i, sec in enumerate(SECTION_ORDER):
+            label = SECTION_LABELS[sec]
+            if i == self._sel:
+                t.append("❯ ", style=f"bold {ACCENT}")
+                t.append(label, style=f"bold {BRIGHT}")
+            else:
+                t.append("  ", style=DIM)
+                t.append(label, style=DIM)
+            if sec == self._live:
+                t.append("  ← auto", style=DIM)
+            if i < len(SECTION_ORDER) - 1:
+                t.append("\n")
+        self.query_one("#sectionresults", Static).update(t)
+
+    def on_key(self, event) -> None:
+        key = event.key
+        if key == "down":
+            self._sel = (self._sel + 1) % len(SECTION_ORDER)
+            self._render_results()
+            event.stop()
+        elif key == "up":
+            self._sel = (self._sel - 1) % len(SECTION_ORDER)
+            self._render_results()
+            event.stop()
+        elif key == "enter":
+            self.dismiss(SECTION_ORDER[self._sel])
+            event.stop()
+        elif key == "escape":
+            return  # let App's priority escape binding dismiss
+
+
 class AgentsApp(App):
     """The agents-tui application."""
 
@@ -1359,11 +1424,11 @@ class AgentsApp(App):
         padding: 0 1;
     }}
 
-    NameInputScreen, DirPickerScreen, ModelPickerScreen {{
+    NameInputScreen, DirPickerScreen, ModelPickerScreen, SectionPickerScreen {{
         align: center middle;
         background: $background 60%;
     }}
-    #namedialog, #dirdialog, #modeldialog {{
+    #namedialog, #dirdialog, #modeldialog, #sectiondialog {{
         width: 78;
         height: auto;
         max-width: 90%;
@@ -1373,7 +1438,7 @@ class AgentsApp(App):
     }}
     /* Breathing room: drop the title off the input/content below it so the
        modals don't feel cramped (consistent across all three steps). */
-    #nameheader, #dirheader, #modelheader {{
+    #nameheader, #dirheader, #modelheader, #sectionheader {{
         height: 1;
         margin: 0 0 1 0;
     }}
@@ -1382,7 +1447,7 @@ class AgentsApp(App):
         width: 1fr;
         margin: 1 0 0 0;
     }}
-    #modelresults {{
+    #modelresults, #sectionresults {{
         height: auto;
         width: 1fr;
     }}
@@ -1786,7 +1851,8 @@ class AgentsApp(App):
         priority `escape` binding (action_clear_filter), which dismisses the
         active modal — so Esc still cancels both modals."""
         return isinstance(self.screen, (ReplyScreen, KillConfirmScreen, ConfirmScreen,
-                                        NameInputScreen, DirPickerScreen, ModelPickerScreen))
+                                        NameInputScreen, DirPickerScreen, ModelPickerScreen,
+                                        SectionPickerScreen))
 
     # ---- selection movement ----
 
@@ -1955,8 +2021,9 @@ class AgentsApp(App):
         if isinstance(self.screen, ConfirmScreen):
             self.screen.dismiss(False)
             return
-        # 2c. new-agent flow modals -> escape CANCELS them.
-        if isinstance(self.screen, (NameInputScreen, DirPickerScreen, ModelPickerScreen)):
+        # 2c. new-agent flow modals + section picker -> escape CANCELS them.
+        if isinstance(self.screen, (NameInputScreen, DirPickerScreen, ModelPickerScreen,
+                                    SectionPickerScreen)):
             self.screen.dismiss(False)
             return
         # 3. filter mode -> escape CANCELS the filter (clears + back to command).
@@ -2192,6 +2259,37 @@ class AgentsApp(App):
 
         self.push_screen(NameInputScreen(), _after_name)
 
+    def _request_move_section_selected(self) -> None:
+        """M: manually MOVE the selected session to another section (override).
+
+        The override pins the row until the session shows new activity (handled
+        in data.gather_agents). Picking the live/auto option clears the override.
+        """
+        if self._modal_active():
+            return
+        a = self.selected_agent
+        if a is None:
+            self.notify("no session selected", timeout=2)
+            return
+        key = self._key(a)
+        current = a.state
+        live = a.live_state
+
+        def _on_pick(target: str | None) -> None:
+            if not target or target == current:
+                return
+            if target == live:
+                data.clear_section_override(key)   # picking the live/auto option un-pins
+                a.pinned = False
+            else:
+                data.set_section_override(key, target)
+                a.pinned = True
+            a.state = target                       # optimistic: move instantly
+            self._rebuild_list()                   # reflect before next gather
+            self.notify(f"moved to {SECTION_LABELS.get(target, target)}", timeout=2)
+
+        self.push_screen(SectionPickerScreen(current, live), _on_pick)
+
     # ---- raw key handling (modal command/filter input model) ----
 
     # Non-printable nav/command keys handled here; everything else falls through.
@@ -2245,6 +2343,8 @@ class AgentsApp(App):
             self._request_reply_selected(); event.stop(); return
         if key in ("n", "N"):
             self._request_new_agent(); event.stop(); return
+        if key in ("m", "M"):
+            self._request_move_section_selected(); event.stop(); return
         if key == "escape":
             # handled by the priority Binding; keep here as a fallback.
             self.action_clear_filter(); event.stop(); return
@@ -2291,6 +2391,7 @@ class FooterBar(Static):
         chips = [
             ("↿⇂", "move"),
             ("r", "reply"),
+            ("m", "move section"),
             ("/", "filter"),
             ("⏎", "open"),
             ("→", "next alert"),
