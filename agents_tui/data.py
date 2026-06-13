@@ -1329,21 +1329,32 @@ def resolve_wid(agent: Agent,
     """Resolve the aerospace window-id for an agent (the Enter-handler target).
 
     Precedence:
-      1. STAMPED @aerospace_wid (collision-free; set on client attach) — use it.
-      2. Live re-read of @aerospace_wid off the active pane (stamp may have
-         landed since gather) — use it.
-      3. TITLE-MATCH FALLBACK: match the agent's cleaned pane_title against the
+      1. STAMPED @aerospace_wid (collision-free; set on client attach), else a
+         live re-read of @aerospace_wid off the active pane (stamp may have
+         landed since gather). Either candidate is VALIDATED against the live
+         aerospace window list and DROPPED if gone (closing a Ghostty window
+         does not clear the stamp, so a dead id can linger) — a stale candidate
+         falls through to the title match below rather than being trusted.
+      2. TITLE-MATCH FALLBACK: match the agent's cleaned pane_title against the
          cleaned Ghostty window titles from `aerospace list-windows --all`.
            - exactly one match  -> that wid
            - 2+ matches          -> AMBIGUOUS_WID (caller refuses to focus)
            - no match            -> None ("no window mapping yet")
     """
-    if agent.aerospace_wid:
-        return agent.aerospace_wid
-    if agent.active_pane:
-        v = pane_opt(agent.active_pane, "@aerospace_wid")
-        if v:
-            return v
+    # candidate from the stamp, else a live re-read off the active pane (the
+    # stamp may have landed since gather). EITHER can be STALE — closing a
+    # Ghostty window does not clear @aerospace_wid, so a dead id lingers on the
+    # pane. Validate against the live window list before trusting it, so we
+    # never hand focus_window a gone wid ("could not focus … (gone?)").
+    cand: Optional[str] = agent.aerospace_wid
+    if not cand and agent.active_pane:
+        cand = pane_opt(agent.active_pane, "@aerospace_wid") or None
+    if cand:
+        if windows is None:
+            windows = aerospace_windows()
+        if any(wid == cand for wid, _app, _title in windows):
+            return cand
+        # stale stamp -> ignore it; fall through to the title match below
     # title-match fallback (best-effort; many fleet sessions predate the stamp)
     if agent.pane_title:
         return match_wid_by_title(agent.pane_title, windows)
@@ -1514,6 +1525,32 @@ def recent_claude_dirs(cap=20):
         return []
     ordered = sorted(last, key=lambda k: last[k], reverse=True)
     return [d for d in ordered if os.path.isdir(d)][:cap]
+
+
+def attach_session_window(session: str) -> tuple[bool, str]:
+    """Open a new Ghostty window attached to an EXISTING detached tmux
+    session (the Enter-on-windowless re-attach path). Does NOT create a
+    session or a new claude — the session already exists. argv lists only,
+    no shell=True. Returns (True, msg) on success, (False, reason) on failure.
+    """
+    # tmux binary path
+    TMUX = "/opt/homebrew/bin/tmux"
+    if not os.path.exists(TMUX):
+        TMUX = shutil.which("tmux") or "tmux"
+
+    # Verify the session is still alive before opening a window onto it
+    r = subprocess.run([TMUX, "has-session", "-t", session],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return (False, "session no longer exists")
+
+    # Open a new Ghostty instance attached to the existing session
+    subprocess.run(
+        ["open", "-na", "Ghostty", "--args", "-e", TMUX, "attach", "-t", session],
+        capture_output=True, text=True
+    )
+
+    return (True, "opening {} in a new window".format(session))
 
 
 def spawn_claude_window(name, directory, model, color):

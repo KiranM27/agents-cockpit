@@ -96,6 +96,25 @@ def _pct_str(pct) -> str:
         return "—"
 
 
+def _is_worktree(path: str) -> bool:
+    """True iff `path` is a LINKED git worktree (not the main checkout).
+
+    A linked worktree has a `.git` FILE (not a directory) whose text is
+    `gitdir: /…/.git/worktrees/<name>`. The main repo has a `.git` directory, and
+    a non-git dir has no `.git` at all — both return False. Used to drop
+    feature-branch worktrees from the new-agent directory picker (Kiran doesn't
+    want them as candidate cwds). Any read error -> False (keep the dir).
+    """
+    gitfile = os.path.join(path, ".git")
+    if not os.path.isfile(gitfile):
+        return False
+    try:
+        with open(gitfile, errors="replace") as f:
+            return "/worktrees/" in f.read()
+    except OSError:
+        return False
+
+
 def _truncate(text: str, width: int) -> str:
     """Clip `text` to `width` cells, appending a Unicode ellipsis when it would
     overflow. A short string is returned untouched; `width <= 0` yields "".
@@ -939,9 +958,21 @@ class DirPickerScreen(ModalScreen):
 
     def __init__(self, dirs: list[str]) -> None:
         super().__init__()
+        # Drop linked git worktrees (feature-branch checkouts) — Kiran doesn't
+        # want them as candidate cwds. Non-git dirs (e.g. /private/tmp) and main
+        # repos are kept; only actual worktrees are excluded.
+        dirs = [d for d in dirs if not _is_worktree(d)]
         self._all_dirs = dirs
         self._filtered = dirs[:]
         self._sel = 0
+        # Basename-collision counts, computed ONCE over the full (post-exclusion)
+        # list. A basename that appears 2+ times is shown WITH its path (to
+        # disambiguate); a unique basename shows name-only. Display-only — the
+        # filter still searches the full path (see on_input_changed).
+        self._base_counts: dict[str, int] = {}
+        for d in dirs:
+            base = os.path.basename(d.rstrip('/')) or d
+            self._base_counts[base] = self._base_counts.get(base, 0) + 1
 
     def compose(self) -> ComposeResult:
         header = Text()
@@ -980,14 +1011,19 @@ class DirPickerScreen(ModalScreen):
         for i in range(start, end):
             d = dirs[i]
             base = os.path.basename(d.rstrip('/')) or d
+            # Show the full path ONLY to disambiguate a colliding basename;
+            # otherwise the name alone (Kiran finds the always-on path noisy).
+            collides = self._base_counts.get(base, 0) >= 2
             if i == sel:
                 t.append("❯ ", style=f"bold {ACCENT}")
                 t.append(base, style=f"bold {BRIGHT}")
-                t.append(f"  {d}", style=DIM)
+                if collides:
+                    t.append(f"  {d}", style=DIM)
             else:
                 t.append("  ", style=DIM)
                 t.append(base, style=DIM)
-                t.append(f"  {d}", style=DIM)
+                if collides:
+                    t.append(f"  {d}", style=DIM)
             if i < end - 1:
                 t.append("\n")
         self.query_one("#dirresults", Static).update(t)
@@ -1331,13 +1367,20 @@ class AgentsApp(App):
         width: 78;
         height: auto;
         max-width: 90%;
-        padding: 1 2;
+        padding: 2 3;
         background: {BG};
         border: round {ACCENT};
+    }}
+    /* Breathing room: drop the title off the input/content below it so the
+       modals don't feel cramped (consistent across all three steps). */
+    #nameheader, #dirheader, #modelheader {{
+        height: 1;
+        margin: 0 0 1 0;
     }}
     #dirresults {{
         height: 14;
         width: 1fr;
+        margin: 1 0 0 0;
     }}
     #modelresults {{
         height: auto;
@@ -1850,13 +1893,10 @@ class AgentsApp(App):
         self._scroll_to_selected()
 
     def action_open_window(self) -> None:
-        """⏎ : focus the selected agent's Ghostty window via aerospace.
-
-        wid resolution (data.resolve_wid): stamped @aerospace_wid first, else a
-        best-effort pane_title -> aerospace-window-title match. On an AMBIGUOUS
-        title match (2+ windows) we REFUSE to focus a possibly-wrong window and
-        say so; on no match we keep the existing "attach it once" message.
-        """
+        """⏎ : focus the selected agent's Ghostty window via aerospace, or — when
+        there is no live window — offer to launch one (re-attach the detached
+        tmux session). A resolved wid that turns out to be gone falls back to the
+        same launch offer instead of dead-ending."""
         if self._modal_active():
             return
         a = self.selected_agent
@@ -1870,23 +1910,30 @@ class AgentsApp(App):
                 timeout=3)
             return
         if not wid:
-            name = a.pane_title or a.label
-            def _on_decision(proceed: bool) -> None:
-                if not proceed:
-                    return
-                ok, msg = data.attach_session_window(a.session)
-                self.notify(msg, severity=("information" if ok else "error"), timeout=3)
-            self.push_screen(
-                ConfirmScreen(
-                    "Launch into a new window?",
-                    f"{name} has no open window. Re-attach its tmux session in a new Ghostty window?",
-                ),
-                _on_decision,
-            )
+            self._offer_launch_window(a)
             return
         ok = data.focus_window(wid)
         if not ok:
-            self.notify(f"could not focus window {wid} (gone?)", timeout=3)
+            # window vanished between resolve and focus (a race the wid
+            # validation can't close) — offer to launch instead of dead-ending.
+            self._offer_launch_window(a)
+
+    def _offer_launch_window(self, a) -> None:
+        """Confirm, then re-attach the agent's existing detached tmux session in
+        a new Ghostty window (no new session/claude — see attach_session_window)."""
+        name = a.pane_title or a.label
+        def _on_decision(proceed: bool) -> None:
+            if not proceed:
+                return
+            ok, msg = data.attach_session_window(a.session)
+            self.notify(msg, severity=("information" if ok else "error"), timeout=3)
+        self.push_screen(
+            ConfirmScreen(
+                "Launch into a new window?",
+                f"{name} has no open window. Re-attach its tmux session in a new Ghostty window?",
+            ),
+            _on_decision,
+        )
 
     def action_clear_filter(self) -> None:
         # The App declares `escape` as a PRIORITY binding. Textual resolves

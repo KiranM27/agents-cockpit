@@ -24,10 +24,12 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 
 from agents_tui import data
 from agents_tui.app import (
-    AgentsApp, NameInputScreen, DirPickerScreen, ModelPickerScreen, SPAWN_COLORS
+    AgentsApp, NameInputScreen, DirPickerScreen, ModelPickerScreen, SPAWN_COLORS,
+    _is_worktree,
 )
 from agents_tui.data import Agent
 from textual.widgets import Input
@@ -183,5 +185,122 @@ async def run() -> int:
     return 0 if not failed else 1
 
 
+def run_worktree_checks() -> int:
+    """Synchronous proofs for _is_worktree (Change 3). Uses tmp dirs so it's
+    deterministic and never touches the real fleet."""
+    passed: list[str] = []
+    failed: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        (passed if cond else failed).append(f"{name}  {detail}".rstrip())
+
+    print("\n===== WORKTREE-DETECTION TESTS =====")
+    with tempfile.TemporaryDirectory() as tmp:
+        # (a) a linked worktree: `.git` is a FILE pointing at .../worktrees/<name>
+        wt = os.path.join(tmp, "feature-worktree")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".git"), "w") as f:
+            f.write("gitdir: /Users/kiran/Desktop/repo/.git/worktrees/feature-worktree\n")
+        is_wt = _is_worktree(wt)
+        print(f"    W1 worktree (.git file -> /worktrees/): _is_worktree={is_wt}")
+        check("W1.worktree_detected", is_wt is True, f"(got {is_wt})")
+
+        # (b) a normal non-git dir: no `.git` at all -> not a worktree
+        plain = os.path.join(tmp, "plain")
+        os.makedirs(plain)
+        is_wt = _is_worktree(plain)
+        print(f"    W2 plain dir (no .git): _is_worktree={is_wt}")
+        check("W2.plain_dir_kept", is_wt is False, f"(got {is_wt})")
+
+        # (c) a real repo (main checkout): `.git` is a DIRECTORY -> not a worktree
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(os.path.join(repo, ".git"))
+        is_wt = _is_worktree(repo)
+        print(f"    W3 main repo (.git dir): _is_worktree={is_wt}")
+        check("W3.main_repo_kept", is_wt is False, f"(got {is_wt})")
+
+        # (d) a `.git` file WITHOUT the /worktrees/ marker (defensive) -> kept
+        weird = os.path.join(tmp, "gitfile-no-worktree")
+        os.makedirs(weird)
+        with open(os.path.join(weird, ".git"), "w") as f:
+            f.write("gitdir: /some/other/path/.git\n")
+        is_wt = _is_worktree(weird)
+        print(f"    W4 .git file w/o /worktrees/: _is_worktree={is_wt}")
+        check("W4.non_worktree_gitfile_kept", is_wt is False, f"(got {is_wt})")
+
+    print("\n===== RESULTS =====")
+    for p in passed:
+        print("  PASS  ", p)
+    for f in failed:
+        print("  FAIL  ", f)
+    print(f"\n{len(passed)} passed, {len(failed)} failed")
+    return 0 if not failed else 1
+
+
+async def run_disambiguation_checks() -> int:
+    """Headless proof for basename disambiguation (Change 2): given two dirs with
+    the SAME basename, BOTH render their full path; a UNIQUE basename renders
+    name-only. Drives the real DirPickerScreen._render_results via a pilot and
+    reads the rendered #dirresults text."""
+    passed: list[str] = []
+    failed: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        (passed if cond else failed).append(f"{name}  {detail}".rstrip())
+
+    print("\n===== DISAMBIGUATION TESTS =====")
+    # Two colliding basenames ("lexi-backend") + one unique ("frontend"). Use
+    # tmp dirs that actually exist and are NOT worktrees so none get filtered.
+    with tempfile.TemporaryDirectory() as tmp:
+        a = os.path.join(tmp, "alpha", "lexi-backend")
+        b = os.path.join(tmp, "beta", "lexi-backend")
+        c = os.path.join(tmp, "frontend")
+        for d in (a, b, c):
+            os.makedirs(d)
+        dirs = [a, b, c]
+
+        app = AgentsApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.refresh_data = lambda: None
+            await pilot.pause()
+            screen = DirPickerScreen(dirs)
+            await app.push_screen(screen)
+            await pilot.pause()
+            from textual.widgets import Static
+            rendered = screen.query_one("#dirresults", Static).render()
+            text = rendered.plain if hasattr(rendered, "plain") else str(rendered)
+
+        # collision counts computed once, worktrees excluded (none here)
+        counts_ok = (screen._base_counts.get("lexi-backend") == 2
+                     and screen._base_counts.get("frontend") == 1
+                     and len(screen._all_dirs) == 3)
+        print(f"    D0 base_counts={screen._base_counts} ndirs={len(screen._all_dirs)}")
+        check("D0.collision_counts_correct", counts_ok, f"({screen._base_counts})")
+
+        # colliding basename -> BOTH full paths appear in the display
+        both_paths = a in text and b in text
+        print(f"    D1 colliding 'lexi-backend' shows both paths: {both_paths}")
+        check("D1.colliding_shows_path", both_paths,
+              f"(a_in={a in text} b_in={b in text})")
+
+        # unique basename 'frontend' -> name shows but its full path does NOT
+        unique_name_only = ("frontend" in text) and (c not in text)
+        print(f"    D2 unique 'frontend' name-only (no path): {unique_name_only}")
+        check("D2.unique_name_only", unique_name_only,
+              f"(name_in={'frontend' in text} path_in={c in text})")
+
+    print("\n===== RESULTS =====")
+    for p in passed:
+        print("  PASS  ", p)
+    for f in failed:
+        print("  FAIL  ", f)
+    print(f"\n{len(passed)} passed, {len(failed)} failed")
+    return 0 if not failed else 1
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(run()))
+    rc_flow = asyncio.run(run())
+    rc_wt = run_worktree_checks()
+    rc_disambig = asyncio.run(run_disambiguation_checks())
+    sys.exit(rc_flow or rc_wt or rc_disambig)
