@@ -20,6 +20,8 @@ session name) so it survives refreshes even as rows reorder.
 from __future__ import annotations
 
 import difflib
+import os
+import random
 from datetime import datetime
 
 from rich.console import Group
@@ -70,6 +72,10 @@ _EFFORT_COLOR = {
     "xhigh": YELLOW,      # yellow (catppuccin)
     "max": ATTN,
 }
+
+MODELS = [("Opus 4.8", "claude-opus-4-8"), ("Sonnet 4.6", "claude-sonnet-4-6"),
+          ("Haiku 4.5", "claude-haiku-4-5-20251001"), ("Fable 5", "claude-fable-5")]
+SPAWN_COLORS = ["red", "blue", "yellow", "purple", "orange", "pink", "cyan"]  # NEVER "green" (reserved)
 
 
 def _state_color(state: str) -> str:
@@ -813,6 +819,192 @@ class ReplyScreen(ModalScreen):
         self.dismiss(ok)
 
 
+
+
+class _PickerInput(Input):
+    async def _on_key(self, event) -> None:
+        if event.key in ("up", "down", "enter"):
+            event.stop()
+            event.prevent_default()
+            self.screen.on_picker_key(event.key)
+            return
+        await super()._on_key(event)
+
+
+class NameInputScreen(ModalScreen):
+    """Step 1 of the new-agent flow: enter a name for the new agent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("New agent — name", style=f"bold {ACCENT}")
+        hint = Text("⏎ next · esc cancel", style=DIM)
+        with Vertical(id="namedialog"):
+            yield Static(header, id="nameheader")
+            yield Input(id="nameinput", placeholder="agent name…")
+            yield Static(hint, id="namehint")
+
+    def on_mount(self) -> None:
+        self.query_one("#nameinput", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        name = self.query_one("#nameinput", Input).value.strip()
+        if name:
+            self.dismiss(name)
+
+
+class DirPickerScreen(ModalScreen):
+    """Step 2 of the new-agent flow: pick a working directory."""
+
+    def __init__(self, dirs: list[str]) -> None:
+        super().__init__()
+        self._all_dirs = dirs
+        self._filtered = dirs[:]
+        self._sel = 0
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("New agent — directory", style=f"bold {ACCENT}")
+        hint = Text("↑/↓ move · ⏎ pick · esc cancel", style=DIM)
+        with Vertical(id="dirdialog"):
+            yield Static(header, id="dirheader")
+            yield _PickerInput(id="dirfilter", placeholder="filter or type a path…")
+            yield Static("", id="dirresults")
+            yield Static(hint, id="dirhint")
+
+    def on_mount(self) -> None:
+        self.query_one("#dirfilter", _PickerInput).focus()
+        self._render_results()
+
+    def _render_results(self) -> None:
+        """Render the filtered directory list with selection highlight."""
+        from rich.text import Text as RText
+        t = RText()
+        dirs = self._filtered
+        if not dirs:
+            t.append("(no matching directories)", style=DIM)
+            self.query_one("#dirresults", Static).update(t)
+            return
+        # Window up to 12 dirs around the selected index
+        sel = self._sel
+        total = len(dirs)
+        if sel < 0:
+            sel = 0
+        if sel >= total:
+            sel = total - 1
+        self._sel = sel
+        start = max(0, sel - 5)
+        end = min(total, start + 12)
+        start = max(0, end - 12)
+        for i in range(start, end):
+            d = dirs[i]
+            base = os.path.basename(d.rstrip('/')) or d
+            if i == sel:
+                t.append("❯ ", style=f"bold {ACCENT}")
+                t.append(base, style=f"bold {BRIGHT}")
+                t.append(f"  {d}", style=DIM)
+            else:
+                t.append("  ", style=DIM)
+                t.append(base, style=DIM)
+                t.append(f"  {d}", style=DIM)
+            if i < end - 1:
+                t.append("\n")
+        self.query_one("#dirresults", Static).update(t)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "dirfilter":
+            return
+        q = event.value.strip().lower()
+        if not q:
+            self._filtered = self._all_dirs[:]
+        else:
+            result = []
+            for d in self._all_dirs:
+                hay = d.lower()
+                if q in hay:
+                    result.append(d)
+                elif difflib.SequenceMatcher(None, q, hay).ratio() > 0.55:
+                    result.append(d)
+                else:
+                    words = hay.replace('/', ' ').replace('-', ' ').replace('_', ' ').split()
+                    if any(difflib.SequenceMatcher(None, q, w).ratio() > 0.7 for w in words):
+                        result.append(d)
+            self._filtered = result
+        self._sel = 0
+        self._render_results()
+
+    def on_picker_key(self, key: str) -> None:
+        if key == "down":
+            if self._filtered:
+                self._sel = (self._sel + 1) % len(self._filtered)
+            self._render_results()
+        elif key == "up":
+            if self._filtered:
+                self._sel = (self._sel - 1) % len(self._filtered)
+            self._render_results()
+        elif key == "enter":
+            if self._filtered:
+                self.dismiss(self._filtered[self._sel])
+            else:
+                filter_text = self.query_one("#dirfilter", _PickerInput).value.strip()
+                if filter_text:
+                    expanded = os.path.expanduser(filter_text)
+                    if os.path.isdir(expanded):
+                        self.dismiss(expanded)
+
+
+class ModelPickerScreen(ModalScreen):
+    """Step 3 of the new-agent flow: pick which Claude model to use."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._sel = 0
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("New agent — model", style=f"bold {ACCENT}")
+        hint = Text("↑/↓ move · ⏎ spawn · esc cancel", style=DIM)
+        with Vertical(id="modeldialog"):
+            yield Static(header, id="modelheader")
+            yield Static("", id="modelresults")
+            yield Static(hint, id="modelhint")
+
+    def on_mount(self) -> None:
+        self._render_results()
+
+    def _render_results(self) -> None:
+        from rich.text import Text as RText
+        t = RText()
+        for i, (display, _model_id) in enumerate(MODELS):
+            if i == self._sel:
+                t.append("❯ ", style=f"bold {ACCENT}")
+                t.append(display, style=f"bold {BRIGHT}")
+            else:
+                t.append("  ", style=DIM)
+                t.append(display, style=DIM)
+            if i < len(MODELS) - 1:
+                t.append("\n")
+        self.query_one("#modelresults", Static).update(t)
+
+    def on_key(self, event) -> None:
+        key = event.key
+        if key == "down":
+            self._sel = (self._sel + 1) % len(MODELS)
+            self._render_results()
+            event.stop()
+        elif key == "up":
+            self._sel = (self._sel - 1) % len(MODELS)
+            self._render_results()
+            event.stop()
+        elif key == "enter":
+            self.dismiss(MODELS[self._sel][1])
+            event.stop()
+        elif key == "escape":
+            return  # let App's priority escape binding dismiss
+
 class AgentsApp(App):
     """The agents-tui application."""
 
@@ -1039,6 +1231,27 @@ class AgentsApp(App):
         background: {BG};
         color: {DIM};
         padding: 0 1;
+    }}
+
+    NameInputScreen, DirPickerScreen, ModelPickerScreen {{
+        align: center middle;
+        background: $background 60%;
+    }}
+    #namedialog, #dirdialog, #modeldialog {{
+        width: 78;
+        height: auto;
+        max-width: 90%;
+        padding: 1 2;
+        background: {BG};
+        border: round {ACCENT};
+    }}
+    #dirresults {{
+        height: 14;
+        width: 1fr;
+    }}
+    #modelresults {{
+        height: auto;
+        width: 1fr;
     }}
     """
 
@@ -1439,7 +1652,8 @@ class AgentsApp(App):
         `escape` is the one exception NOT blanket-guarded: it reaches the App's
         priority `escape` binding (action_clear_filter), which dismisses the
         active modal — so Esc still cancels both modals."""
-        return isinstance(self.screen, (ReplyScreen, KillConfirmScreen, ConfirmScreen))
+        return isinstance(self.screen, (ReplyScreen, KillConfirmScreen, ConfirmScreen,
+                                        NameInputScreen, DirPickerScreen, ModelPickerScreen))
 
     # ---- selection movement ----
 
@@ -1590,6 +1804,10 @@ class AgentsApp(App):
             return
         # 2b. generic confirm modal open -> escape CANCELS it.
         if isinstance(self.screen, ConfirmScreen):
+            self.screen.dismiss(False)
+            return
+        # 2c. new-agent flow modals -> escape CANCELS them.
+        if isinstance(self.screen, (NameInputScreen, DirPickerScreen, ModelPickerScreen)):
             self.screen.dismiss(False)
             return
         # 3. filter mode -> escape CANCELS the filter (clears + back to command).
@@ -1797,6 +2015,34 @@ class AgentsApp(App):
         display_name = AgentRow._card_title(a)
         self.push_screen(ReplyScreen(display_name, pane))
 
+    def _request_new_agent(self) -> None:
+        """N: launch the 3-step new-agent flow (name -> dir -> model -> spawn)."""
+        if self._modal_active():
+            return
+
+        def _after_name(name):
+            if not name:
+                return
+            dirs = data.recent_claude_dirs()
+
+            def _after_dir(directory):
+                if not directory:
+                    return
+
+                def _after_model(model_id):
+                    if not model_id:
+                        return
+                    color = random.choice(SPAWN_COLORS)
+                    ok, msg = data.spawn_claude_window(name, directory, model_id, color)
+                    self.notify(msg, severity=("information" if ok else "error"),
+                                timeout=4)
+
+                self.push_screen(ModelPickerScreen(), _after_model)
+
+            self.push_screen(DirPickerScreen(dirs), _after_dir)
+
+        self.push_screen(NameInputScreen(), _after_name)
+
     # ---- raw key handling (modal command/filter input model) ----
 
     # Non-printable nav/command keys handled here; everything else falls through.
@@ -1848,6 +2094,8 @@ class AgentsApp(App):
             self._enter_filter_mode(); event.stop(); return
         if key == "r":
             self._request_reply_selected(); event.stop(); return
+        if key in ("n", "N"):
+            self._request_new_agent(); event.stop(); return
         if key == "escape":
             # handled by the priority Binding; keep here as a fallback.
             self.action_clear_filter(); event.stop(); return

@@ -22,7 +22,10 @@ from __future__ import annotations
 import glob
 import json
 import os
+import random
 import re
+import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -1481,3 +1484,102 @@ def kill_session(session_name: str) -> bool:
         return r.returncode == 0
     except Exception:
         return False
+
+
+def recent_claude_dirs(cap=20):
+    """Distinct dirs Kiran recently launched Claude Code from, newest first.
+
+    Source: ~/.claude/history.jsonl (append-only; each line is JSON with an
+    absolute-path `project` field + epoch-MILLISECOND `timestamp`). Streamed
+    line-by-line (~2.3MB) tolerating bad lines. Keeps the newest timestamp per
+    distinct project, sorts descending, drops non-existent dirs, returns first
+    `cap`.
+    """
+    import json, os
+    last = {}
+    p = os.path.expanduser("~/.claude/history.jsonl")
+    try:
+        with open(p, errors="replace") as f:
+            for ln in f:
+                try:
+                    d = json.loads(ln)
+                except Exception:
+                    continue
+                proj, ts = d.get("project"), d.get("timestamp")
+                if not proj or ts is None:
+                    continue
+                if proj not in last or ts > last[proj]:
+                    last[proj] = ts
+    except OSError:
+        return []
+    ordered = sorted(last, key=lambda k: last[k], reverse=True)
+    return [d for d in ordered if os.path.isdir(d)][:cap]
+
+
+def spawn_claude_window(name, directory, model, color):
+    """Spawn a new detached tmux session running claude, open Ghostty, auto-color.
+
+    Returns (True, message) on success, (False, reason) on failure.
+    Uses argv lists, NO shell=True anywhere.
+    """
+    # Validate directory
+    if not os.path.isdir(directory):
+        return (False, "no such directory")
+
+    # Derive tmux session slug: keep only [A-Za-z0-9_-], replace others with '-',
+    # strip leading/trailing '-', fall back to "agent" if empty.
+    slug_chars = []
+    for ch in name:
+        if ch.isalnum() or ch in ('_', '-'):
+            slug_chars.append(ch)
+        else:
+            slug_chars.append('-')
+    slug_base = ''.join(slug_chars).strip('-') or 'agent'
+
+    # tmux binary path
+    TMUX = "/opt/homebrew/bin/tmux"
+    if not os.path.exists(TMUX):
+        TMUX = shutil.which("tmux") or "tmux"
+
+    # Collision handling: find a free slug
+    slug = slug_base
+    for n in range(2, 100):
+        r = subprocess.run([TMUX, "has-session", "-t", slug],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            break  # slug is free
+        slug = "{}-{}".format(slug_base, n)
+
+    # Build the inner command string for zsh -lc
+    cmd = "/bin/zsh -lc " + shlex.quote(
+        "exec claude --model {} --name {}".format(model, shlex.quote(name))
+    )
+
+    # Create the detached tmux session
+    r = subprocess.run(
+        [TMUX, "new-session", "-d", "-s", slug, "-c", directory, cmd],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return (False, "tmux new-session failed")
+
+    # Open a new Ghostty instance attached to it
+    subprocess.run(
+        ["open", "-na", "Ghostty", "--args", "-e", TMUX, "attach", "-t", slug],
+        capture_output=True, text=True
+    )
+
+    # Auto-color: detached background helper that waits ~10s then sends /color
+    helper = (
+        "python3 -c 'import time;time.sleep(10)'; "
+        "{tmux} send-keys -t {slug} -l '/color {color}'; "
+        "{tmux} send-keys -t {slug} Enter"
+    ).format(tmux=shlex.quote(TMUX), slug=shlex.quote(slug), color=color)
+    subprocess.Popen(["/bin/zsh", "-lc", helper], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return (True, "spawned {} in {} on {}".format(
+        name,
+        os.path.basename(directory.rstrip('/')) or directory,
+        model
+    ))
