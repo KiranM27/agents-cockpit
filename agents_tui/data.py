@@ -95,6 +95,11 @@ MAX_LINE_BYTES = 200 * 1024  # skip single records larger than this (attachment/
 
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/*/{sid}.jsonl")
 
+# /color palette for spawned/restarted agent windows. NEVER "green" (reserved
+# for the dispatcher session). Lives here (the primitives layer) because both
+# spawn_claude_window and restart_agent pick from it; app.py re-exports it.
+SPAWN_COLORS = ["red", "blue", "yellow", "purple", "orange", "pink", "cyan"]
+
 # Section ordering for the list: needs-you (red) on top, then running, then
 # inactive (idle) at the bottom. Drives the PRIMARY sort key in gather_agents.
 # Unknown states sink to the inactive section.
@@ -1516,6 +1521,62 @@ def send_message_to_pane(pane: str, text: str) -> tuple[bool, str]:
     return (True, "")
 
 
+def rename_claude_session(pane: str, new_name: str) -> tuple[bool, str]:
+    """Rename the running Claude session by TYPING `/rename <new_name>` into it.
+
+    CRITICAL: the slash command must be TYPED, not pasted. Claude Code only
+    executes a leading-slash line as a command when it arrives as literal
+    keystrokes; bracketed-paste (load-buffer/paste-buffer, as the multi-line
+    path in send_message_to_pane uses) is treated as ordinary input and the
+    command is NOT run. So we always use `send-keys -l` (literal) for the
+    command text, then a SEPARATE `send-keys Enter` to submit — never a paste
+    buffer. Reuses send_message_to_pane's pane-exists + copy-mode guards.
+
+    Returns (True, "renamed to <name>") on success, else (False, "<reason>").
+    """
+    if not pane:
+        return (False, "no pane")
+    new_name = new_name.strip()
+    if not new_name:
+        return (False, "empty name")
+
+    # copy-mode guard (mirrors send_message_to_pane): a scrolled pane would land
+    # the keystrokes in the scrollback, not the prompt.
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_in_mode}"],
+            capture_output=True, text=True, timeout=4.0,
+        )
+    except Exception as e:  # noqa: BLE001
+        return (False, f"tmux error: {e}")
+    if r.returncode != 0:
+        return (False, "pane not found")
+    if r.stdout.strip() == "1":
+        return (False, "pane is scrolled (copy-mode); exit it and retry")
+
+    try:
+        # Type the slash command literally (-l so '/'/spaces aren't key names).
+        sk = subprocess.run(
+            ["tmux", "send-keys", "-t", pane, "-l", "/rename " + new_name],
+            capture_output=True, text=True, timeout=4.0,
+        )
+        if sk.returncode != 0:
+            return (False, "send-keys failed")
+        # Brief delay so Claude registers the typed command before the Enter
+        # (the same ordering the user does by hand). SEPARATE call so Enter is a
+        # real keypress that submits the command.
+        time.sleep(0.15)
+        en = subprocess.run(
+            ["tmux", "send-keys", "-t", pane, "Enter"],
+            capture_output=True, text=True, timeout=4.0,
+        )
+        if en.returncode != 0:
+            return (False, "send Enter failed")
+    except Exception as e:  # noqa: BLE001
+        return (False, f"tmux error: {e}")
+    return (True, f"renamed to {new_name}")
+
+
 def kill_session(session_name: str) -> bool:
     """`tmux kill-session -t <session_name>`. Returns True on returncode 0.
 
@@ -1593,6 +1654,76 @@ def attach_session_window(session: str) -> tuple[bool, str]:
     return (True, "opening {} in a new window".format(session))
 
 
+def _tmux_bin() -> str:
+    """Absolute tmux path, falling back to PATH lookup then bare 'tmux'."""
+    tmux = "/opt/homebrew/bin/tmux"
+    if not os.path.exists(tmux):
+        tmux = shutil.which("tmux") or "tmux"
+    return tmux
+
+
+def _slugify_session(name: str) -> str:
+    """tmux session slug: keep [A-Za-z0-9_-], others -> '-', strip, fall back."""
+    slug_chars = []
+    for ch in name:
+        if ch.isalnum() or ch in ('_', '-'):
+            slug_chars.append(ch)
+        else:
+            slug_chars.append('-')
+    return ''.join(slug_chars).strip('-') or 'agent'
+
+
+def _free_tmux_slug(slug_base: str, tmux: str) -> str:
+    """Find a free session slug: slug_base, else slug_base-2, -3, … (cap 99)."""
+    slug = slug_base
+    for n in range(2, 100):
+        r = subprocess.run([tmux, "has-session", "-t", slug],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            break  # slug is free
+        slug = "{}-{}".format(slug_base, n)
+    return slug
+
+
+def _open_claude_window(slug, directory, inner_cmd, color, tmux=None):
+    """Create a detached tmux session running `inner_cmd`, open Ghostty on it,
+    and auto-/color it in the background. Shared by spawn_claude_window and
+    restart_agent so the window-opening mechanics live in ONE place.
+
+    `inner_cmd` is the zsh -lc payload (e.g. "exec claude …"); it is shell-
+    quoted here. argv lists only, NO shell=True. Returns (True, "") on success,
+    else (False, reason).
+    """
+    tmux = tmux or _tmux_bin()
+
+    # Build the inner command string for zsh -lc
+    cmd = "/bin/zsh -lc " + shlex.quote(inner_cmd)
+
+    # Create the detached tmux session
+    r = subprocess.run(
+        [tmux, "new-session", "-d", "-s", slug, "-c", directory, cmd],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return (False, "tmux new-session failed")
+
+    # Open a new Ghostty instance attached to it
+    subprocess.run(
+        ["open", "-na", "Ghostty", "--args", "-e", tmux, "attach", "-t", slug],
+        capture_output=True, text=True
+    )
+
+    # Auto-color: detached background helper that waits ~10s then sends /color
+    helper = (
+        "python3 -c 'import time;time.sleep(10)'; "
+        "{tmux} send-keys -t {slug} -l '/color {color}'; "
+        "{tmux} send-keys -t {slug} Enter"
+    ).format(tmux=shlex.quote(tmux), slug=shlex.quote(slug), color=color)
+    subprocess.Popen(["/bin/zsh", "-lc", helper], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return (True, "")
+
+
 def spawn_claude_window(name, directory, model, color):
     """Spawn a new detached tmux session running claude, open Ghostty, auto-color.
 
@@ -1603,60 +1734,102 @@ def spawn_claude_window(name, directory, model, color):
     if not os.path.isdir(directory):
         return (False, "no such directory")
 
-    # Derive tmux session slug: keep only [A-Za-z0-9_-], replace others with '-',
-    # strip leading/trailing '-', fall back to "agent" if empty.
-    slug_chars = []
-    for ch in name:
-        if ch.isalnum() or ch in ('_', '-'):
-            slug_chars.append(ch)
-        else:
-            slug_chars.append('-')
-    slug_base = ''.join(slug_chars).strip('-') or 'agent'
+    tmux = _tmux_bin()
+    slug = _free_tmux_slug(_slugify_session(name), tmux)
 
-    # tmux binary path
-    TMUX = "/opt/homebrew/bin/tmux"
-    if not os.path.exists(TMUX):
-        TMUX = shutil.which("tmux") or "tmux"
-
-    # Collision handling: find a free slug
-    slug = slug_base
-    for n in range(2, 100):
-        r = subprocess.run([TMUX, "has-session", "-t", slug],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            break  # slug is free
-        slug = "{}-{}".format(slug_base, n)
-
-    # Build the inner command string for zsh -lc
-    cmd = "/bin/zsh -lc " + shlex.quote(
-        "exec claude --model {} --name {}".format(model, shlex.quote(name))
-    )
-
-    # Create the detached tmux session
-    r = subprocess.run(
-        [TMUX, "new-session", "-d", "-s", slug, "-c", directory, cmd],
-        capture_output=True, text=True
-    )
-    if r.returncode != 0:
-        return (False, "tmux new-session failed")
-
-    # Open a new Ghostty instance attached to it
-    subprocess.run(
-        ["open", "-na", "Ghostty", "--args", "-e", TMUX, "attach", "-t", slug],
-        capture_output=True, text=True
-    )
-
-    # Auto-color: detached background helper that waits ~10s then sends /color
-    helper = (
-        "python3 -c 'import time;time.sleep(10)'; "
-        "{tmux} send-keys -t {slug} -l '/color {color}'; "
-        "{tmux} send-keys -t {slug} Enter"
-    ).format(tmux=shlex.quote(TMUX), slug=shlex.quote(slug), color=color)
-    subprocess.Popen(["/bin/zsh", "-lc", helper], start_new_session=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    inner = "exec claude --model {} --name {}".format(model, shlex.quote(name))
+    ok, reason = _open_claude_window(slug, directory, inner, color, tmux)
+    if not ok:
+        return (False, reason)
 
     return (True, "spawned {} in {} on {}".format(
         name,
         os.path.basename(directory.rstrip('/')) or directory,
         model
     ))
+
+
+# Map Claude's statusline `model.display_name` (what Agent.model holds, e.g.
+# "Opus 4.8") to the `--model` value spawn_claude_window passes successfully
+# (the MODELS ids in app.py). Exact current models map to their full id; any
+# other display string (older models like "Sonnet 4.5"/"Opus 4.1", or a future
+# one) falls back to the family alias (first word lowercased) which `claude
+# --model` also accepts ('opus'/'sonnet'/'haiku'/'fable'). Unknown -> None
+# (caller omits --model).
+_MODEL_DISPLAY_TO_ID = {
+    "Opus 4.8": "claude-opus-4-8",
+    "Sonnet 4.6": "claude-sonnet-4-6",
+    "Haiku 4.5": "claude-haiku-4-5-20251001",
+    "Fable 5": "claude-fable-5",
+}
+_MODEL_FAMILY_ALIASES = {"opus", "sonnet", "haiku", "fable"}
+
+
+def _model_flag(display: Optional[str]) -> Optional[str]:
+    """Resolve Agent.model (a display_name) to a `--model` value, or None."""
+    if not display:
+        return None
+    display = display.strip()
+    if display in _MODEL_DISPLAY_TO_ID:
+        return _MODEL_DISPLAY_TO_ID[display]
+    first = display.split()[0].lower() if display.split() else ""
+    if first in _MODEL_FAMILY_ALIASES:
+        return first
+    return None
+
+
+def restart_agent(session, cwd, model, session_id) -> tuple[bool, str]:
+    """Kill the agent's tmux session and reopen a FRESH window that RESUMES the
+    same Claude conversation (so it reloads newly-created skills while keeping
+    the chat). Reuses the same tmux slug for continuity when it frees in time.
+
+    Args mirror the Agent fields: `session` (tmux slug), `cwd` (abs path to run
+    in), `model` (Agent.model display string, may be None), `session_id`
+    (Claude conversation uuid, may be None). Returns (True, "restarted …") on
+    success, else (False, reason). argv lists only, NO shell=True.
+    """
+    if not session:
+        return (False, "no session")
+    if not cwd or not os.path.isdir(cwd):
+        return (False, "no such directory")
+
+    tmux = _tmux_bin()
+
+    # 1. kill the old session.
+    if not kill_session(session):
+        return (False, "failed to kill old session")
+
+    # 2. reuse the SAME slug for continuity: poll until tmux frees it (kill is
+    #    async-ish), up to ~1.5s. If it won't free, fall back to a bumped slug.
+    slug = session
+    freed = False
+    for _ in range(15):
+        r = subprocess.run([tmux, "has-session", "-t", slug],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            freed = True
+            break
+        time.sleep(0.1)
+    if not freed:
+        slug = _free_tmux_slug(session, tmux)
+
+    # 3. build the resume command. --resume <uuid> reloads THIS conversation;
+    #    without a uuid, --continue picks the most recent one in cwd. The model
+    #    flag is omitted when it can't be resolved (claude then uses its default).
+    parts = ["exec", "claude"]
+    if session_id:
+        parts += ["--resume", shlex.quote(session_id)]
+    else:
+        parts += ["--continue"]
+    mflag = _model_flag(model)
+    if mflag:
+        parts += ["--model", shlex.quote(mflag)]
+    inner = " ".join(parts)
+
+    # 4. open the fresh window (fresh random color is fine; preservation N/A).
+    color = random.choice(SPAWN_COLORS)
+    ok, reason = _open_claude_window(slug, cwd, inner, color, tmux)
+    if not ok:
+        return (False, reason)
+
+    return (True, "restarted {}".format(session))

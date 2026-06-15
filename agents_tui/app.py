@@ -75,7 +75,7 @@ _EFFORT_COLOR = {
 
 MODELS = [("Opus 4.8", "claude-opus-4-8"), ("Sonnet 4.6", "claude-sonnet-4-6"),
           ("Haiku 4.5", "claude-haiku-4-5-20251001"), ("Fable 5", "claude-fable-5")]
-SPAWN_COLORS = ["red", "blue", "yellow", "purple", "orange", "pink", "cyan"]  # NEVER "green" (reserved)
+SPAWN_COLORS = data.SPAWN_COLORS  # re-exported; defined in data (NEVER "green", reserved)
 
 
 def _state_color(state: str) -> str:
@@ -1184,6 +1184,111 @@ class SectionPickerScreen(ModalScreen):
             return  # let App's priority escape binding dismiss
 
 
+# Actions available from the `A` menu, in display order:
+# (key, title, description). Keep this minimal — two actions only.
+_ACTIONS = [
+    ("rename", "Rename", "change this window's name"),
+    ("restart", "Restart", "reopen & resume this conversation"),
+]
+
+
+class ActionMenuScreen(ModalScreen):
+    """The `A` actions menu: a spacious fixed-list picker for the selected agent.
+
+    Mirrors ModelPickerScreen's key handling (↑/↓ wrap, ⏎ select, escape routed
+    via the App's priority escape binding). Dismisses with the chosen action key
+    ('rename' / 'restart'), or False on cancel. Two lines per action (title +
+    dim description) with a blank line between blocks so it reads roomy.
+    """
+
+    def __init__(self, display_name: str) -> None:
+        super().__init__()
+        self._display_name = display_name
+        self._sel = 0
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("Actions ", style=f"bold {BRIGHT}")
+        header.append("· ", style=DIM)
+        header.append(self._display_name, style=f"bold {ACCENT}")
+        hint = Text("↑/↓ move · ⏎ select · esc cancel", style=DIM)
+        with Vertical(id="actiondialog"):
+            yield Static(header, id="actionheader")
+            yield Static("", id="actionresults")
+            yield Static(hint, id="actionhint")
+
+    def on_mount(self) -> None:
+        self._render_results()
+
+    def _render_results(self) -> None:
+        t = Text()
+        for i, (_akey, title, desc) in enumerate(_ACTIONS):
+            if i == self._sel:
+                t.append("❯  ", style=f"bold {ACCENT}")
+                t.append(title, style=f"bold {ACCENT}")
+            else:
+                t.append("   ", style=DIM)
+                t.append(title, style=BRIGHT)
+            t.append("\n")
+            # description line is always DIM, indented under the title.
+            t.append("      ", style=DIM)
+            t.append(desc, style=DIM)
+            if i < len(_ACTIONS) - 1:
+                t.append("\n\n")   # blank line between action blocks (spacious)
+        self.query_one("#actionresults", Static).update(t)
+
+    def on_key(self, event) -> None:
+        key = event.key
+        if key == "down":
+            self._sel = (self._sel + 1) % len(_ACTIONS)
+            self._render_results()
+            event.stop()
+        elif key == "up":
+            self._sel = (self._sel - 1) % len(_ACTIONS)
+            self._render_results()
+            event.stop()
+        elif key == "enter":
+            self.dismiss(_ACTIONS[self._sel][0])
+            event.stop()
+        elif key == "escape":
+            return  # let App's priority escape binding dismiss
+
+
+class RenameScreen(ModalScreen):
+    """Rename action: a single Input PRE-FILLED with the agent's current name.
+
+    Like NameInputScreen but seeded (value + cursor at end, focused on open).
+    Enter -> dismiss(stripped value); empty -> dismiss(None) (treated as cancel
+    by the caller). Escape is routed via the App's priority escape binding.
+    """
+
+    def __init__(self, current_name: str) -> None:
+        super().__init__()
+        self._current_name = current_name
+
+    def compose(self) -> ComposeResult:
+        header = Text()
+        header.append("Rename ", style=f"bold {BRIGHT}")
+        header.append("· ", style=DIM)
+        header.append(self._current_name, style=f"bold {ACCENT}")
+        hint = Text("⏎ rename · esc cancel", style=DIM)
+        with Vertical(id="renamedialog"):
+            yield Static(header, id="renameheader")
+            yield Input(value=self._current_name, id="renameinput")
+            yield Static(hint, id="renamehint")
+
+    def on_mount(self) -> None:
+        inp = self.query_one("#renameinput", Input)
+        inp.focus()
+        # cursor at end so the user can append/edit immediately.
+        inp.cursor_position = len(inp.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        value = self.query_one("#renameinput", Input).value.strip()
+        self.dismiss(value or None)
+
+
 class AgentsApp(App):
     """The agents-tui application."""
 
@@ -1424,11 +1529,13 @@ class AgentsApp(App):
         padding: 0 1;
     }}
 
-    NameInputScreen, DirPickerScreen, ModelPickerScreen, SectionPickerScreen {{
+    NameInputScreen, DirPickerScreen, ModelPickerScreen, SectionPickerScreen,
+    ActionMenuScreen, RenameScreen {{
         align: center middle;
         background: $background 60%;
     }}
-    #namedialog, #dirdialog, #modeldialog, #sectiondialog {{
+    #namedialog, #dirdialog, #modeldialog, #sectiondialog,
+    #actiondialog, #renamedialog {{
         width: 78;
         height: auto;
         max-width: 90%;
@@ -1438,7 +1545,8 @@ class AgentsApp(App):
     }}
     /* Breathing room: drop the title off the input/content below it so the
        modals don't feel cramped (consistent across all three steps). */
-    #nameheader, #dirheader, #modelheader, #sectionheader {{
+    #nameheader, #dirheader, #modelheader, #sectionheader,
+    #actionheader, #renameheader {{
         height: 1;
         margin: 0 0 1 0;
     }}
@@ -1447,9 +1555,16 @@ class AgentsApp(App):
         width: 1fr;
         margin: 1 0 0 0;
     }}
-    #modelresults, #sectionresults {{
+    #modelresults, #sectionresults, #actionresults {{
         height: auto;
         width: 1fr;
+    }}
+    /* Pre-filled rename input: a little vertical room around it (matches the
+       spacious feel of the other single-input modals). */
+    #renameinput {{
+        width: 1fr;
+        margin: 1 0 0 0;
+        background: {BG};
     }}
     """
 
@@ -1855,7 +1970,7 @@ class AgentsApp(App):
         active modal — so Esc still cancels both modals."""
         return isinstance(self.screen, (ReplyScreen, KillConfirmScreen, ConfirmScreen,
                                         NameInputScreen, DirPickerScreen, ModelPickerScreen,
-                                        SectionPickerScreen))
+                                        SectionPickerScreen, ActionMenuScreen, RenameScreen))
 
     # ---- selection movement ----
 
@@ -2029,6 +2144,10 @@ class AgentsApp(App):
         if isinstance(self.screen, (NameInputScreen, DirPickerScreen, ModelPickerScreen,
                                     SectionPickerScreen)):
             self.screen.dismiss(False)
+            return
+        # 2d. actions menu + rename modal -> escape CANCELS them.
+        if isinstance(self.screen, (ActionMenuScreen, RenameScreen)):
+            self.screen.dismiss(None)
             return
         # 3. filter mode -> escape CANCELS the filter (clears + back to command).
         if self._filter_mode:
@@ -2236,6 +2355,100 @@ class AgentsApp(App):
         display_name = AgentRow._card_title(a)
         self.push_screen(ReplyScreen(display_name, pane))
 
+    # ---- actions menu (entered with `A`) ----
+
+    def _request_actions_menu(self) -> None:
+        """A: open the spacious Actions menu for the selected agent.
+
+        Captures the fields the downstream actions need NOW into locals (the
+        selected_agent can go stale across the modal chain, exactly as the kill
+        flow captures up front), then opens ActionMenuScreen. The chosen action
+        is handled in _after_action_choice, which closes over these captures.
+        """
+        if self._modal_active():
+            return
+        a = self.selected_agent
+        if a is None:
+            self.notify("no agent selected", timeout=2)
+            return
+        # capture everything the rename/restart paths need up front.
+        pane = a.active_pane
+        cwd = a.cwd
+        model = a.model
+        session = a.session
+        session_id = a.session_id
+        display_name = AgentRow._card_title(a)
+
+        self.push_screen(
+            ActionMenuScreen(display_name),
+            lambda choice: self._after_action_choice(
+                choice, pane, cwd, model, session, session_id, display_name),
+        )
+
+    def _after_action_choice(self, choice, pane, cwd, model, session,
+                             session_id, display_name) -> None:
+        """Dispatch the picked action. Pushing a new screen inside this dismiss-
+        callback is the established pattern (see the new-agent flow chain)."""
+        if choice == "rename":
+            def _after_rename(new_name) -> None:
+                if not new_name:
+                    return  # empty / cancelled
+                if new_name == display_name:
+                    self.notify("name unchanged", timeout=2)
+                    return
+                if not pane:
+                    self.notify("no pane to rename", severity="error", timeout=3)
+                    return
+                ok, msg = data.rename_claude_session(pane, new_name)
+                self.notify(msg, severity=("information" if ok else "error"),
+                            timeout=3)
+
+            self.push_screen(RenameScreen(display_name), _after_rename)
+        elif choice == "restart":
+            self._request_restart(session, cwd, model, session_id, display_name)
+        else:
+            return  # cancelled (None / False)
+
+    def _request_restart(self, session, cwd, model, session_id,
+                         display_name) -> None:
+        """Confirm + restart: kill the agent's window and reopen a fresh one
+        RESUMING the same conversation (picks up newly-created skills).
+
+        SELF-GUARD: never restart the cockpit's own tmux session.
+        """
+        self_sess = data.current_tmux_session()
+        if self_sess is not None and session == self_sess:
+            self.notify("can't restart the cockpit's own session", timeout=3)
+            return
+
+        def _on_decision(confirmed) -> None:
+            if confirmed is not True:
+                return  # None / False both cancel
+            ok, msg = data.restart_agent(session, cwd, model, session_id)
+            if ok:
+                # Drop the old row immediately (like _do_kill) for instant
+                # feedback. We deliberately PRESERVE _selected_key across the
+                # drop: _apply_agents -> _rebuild_list nulls a key whose row has
+                # vanished, but the restarted session comes back with the SAME
+                # slug / session_id, so re-asserting the key here means it
+                # re-selects ITSELF (not whatever lands at row 0) on the next
+                # refresh tick.
+                keep_key = self._selected_key
+                survivors = [a for a in self.agents if a.session != session]
+                self._apply_agents(survivors)
+                self._selected_key = keep_key
+            self.notify(msg, severity=("information" if ok else "error"),
+                        timeout=4)
+
+        self.push_screen(
+            ConfirmScreen(
+                "Restart agent?",
+                f"Reopen '{display_name}' in a fresh window and resume this "
+                f"conversation? Picks up newly-created skills.",
+            ),
+            _on_decision,
+        )
+
     def _request_new_agent(self) -> None:
         """N: launch the 3-step new-agent flow (name -> dir -> model -> spawn)."""
         if self._modal_active():
@@ -2357,6 +2570,8 @@ class AgentsApp(App):
             self._enter_filter_mode(); event.stop(); return
         if key == "r":
             self._request_reply_selected(); event.stop(); return
+        if key in ("a", "A"):
+            self._request_actions_menu(); event.stop(); return
         if key in ("n", "N"):
             self._request_new_agent(); event.stop(); return
         if key in ("m", "M"):
@@ -2409,6 +2624,7 @@ class FooterBar(Static):
             ("⏎", "open"),
             ("←/→", "tabs"),
             ("r", "reply"),
+            ("a", "actions"),
             ("m", "move section"),
             ("n", "new window"),
             ("/", "filter"),
