@@ -1645,11 +1645,17 @@ def attach_session_window(session: str) -> tuple[bool, str]:
     if r.returncode != 0:
         return (False, "session no longer exists")
 
-    # Open a new Ghostty instance attached to the existing session
-    subprocess.run(
-        ["open", "-na", "Ghostty", "--args", "-e", TMUX, "attach", "-t", session],
+    # Open a new Ghostty WINDOW in the EXISTING instance attached to the
+    # session (no `open -na` new-instance). Shared ghostty-window CLI (native
+    # AppleScript); args via argv -> no AppleScript injection.
+    attach_cmd = "/bin/zsh -lc " + shlex.quote("exec {} attach -t {}".format(TMUX, session))
+    ghostty_window = os.path.expanduser("~/.local/bin/ghostty-window")
+    w = subprocess.run(
+        [ghostty_window, os.path.expanduser("~"), attach_cmd],
         capture_output=True, text=True
     )
+    if w.returncode != 0:
+        return (False, "ghostty-window failed: " + (w.stderr.strip() or "nonzero exit"))
 
     return (True, "opening {} in a new window".format(session))
 
@@ -1707,11 +1713,18 @@ def _open_claude_window(slug, directory, inner_cmd, color, tmux=None):
     if r.returncode != 0:
         return (False, "tmux new-session failed")
 
-    # Open a new Ghostty instance attached to it
-    subprocess.run(
-        ["open", "-na", "Ghostty", "--args", "-e", tmux, "attach", "-t", slug],
+    # Open a new Ghostty WINDOW in the EXISTING instance (one process, no
+    # `open -na` proliferation), attached to the tmux session. Uses the shared
+    # `ghostty-window` CLI (Ghostty native AppleScript `new window`). dir/cmd
+    # go to osascript as argv, never interpolated -> no AppleScript injection.
+    attach_cmd = "/bin/zsh -lc " + shlex.quote("exec {} attach -t {}".format(tmux, slug))
+    ghostty_window = os.path.expanduser("~/.local/bin/ghostty-window")
+    w = subprocess.run(
+        [ghostty_window, directory, attach_cmd],
         capture_output=True, text=True
     )
+    if w.returncode != 0:
+        return (False, "ghostty-window failed: " + (w.stderr.strip() or "nonzero exit"))
 
     # Auto-color: detached background helper that waits ~10s then sends /color
     helper = (
