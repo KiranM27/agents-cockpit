@@ -33,37 +33,6 @@ if command -v aerospace >/dev/null 2>&1; then
   aerospace workspace D              >/dev/null 2>&1 || true
 fi
 
-# Best-effort: ensure the ctx-monitor sidecar is running (it feeds the cockpit's
-# Context tab + drives the checkpoint cycle). Spawn it DETACHED so it survives
-# the cockpit closing. NEVER block or fail the cockpit launch — the whole block
-# is wrapped so any error is swallowed. ctx-monitor is pure stdlib, so we use
-# SYSTEM python3 (NOT the cockpit venv). The monitor's own flock makes a
-# redundant spawn a harmless no-op, so "spawn if the lock-PID isn't alive" is
-# safe even against races.
-{
-  CTX_DIR="/tmp/claude-ctx"
-  MON="${HOME}/.claude/tools/ctx-monitor/ctx-monitor.py"
-  mkdir -p "$CTX_DIR"
-  monitor_alive=0
-  if [ -f "$CTX_DIR/monitor.lock" ]; then
-    lock_pid="$(cat "$CTX_DIR/monitor.lock" 2>/dev/null | tr -dc '0-9')"
-    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
-      monitor_alive=1
-    fi
-  fi
-  if [ "$monitor_alive" -eq 0 ] && [ -f "$MON" ]; then
-    SYS_PY="$(command -v python3 || true)"
-    if [ -n "$SYS_PY" ]; then
-      if command -v setsid >/dev/null 2>&1; then
-        setsid "$SYS_PY" "$MON" >> "$CTX_DIR/monitor.out" 2>&1 < /dev/null &
-      else
-        nohup "$SYS_PY" "$MON" >> "$CTX_DIR/monitor.out" 2>&1 < /dev/null &
-        disown
-      fi
-    fi
-  fi
-} || true
-
 # Run from this dir so `python -m agents_tui` resolves the package regardless
 # of the caller's cwd (PYTHONPATH also set as a belt-and-braces fallback).
 export PYTHONPATH="${HERE}${PYTHONPATH:+:$PYTHONPATH}"

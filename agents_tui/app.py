@@ -598,7 +598,7 @@ class ContextPane(VerticalScroll):
     Columns match ctx-monitor.py's render_lines(): PANE, NAME, DIR, SESSION
     (session8), CONTEXT (used %), STATE (the cosmetic serial `#` is dropped). A
     liveness line at the top reports whether the monitor sidecar is running
-    (from monitor.lock's PID). ERROR rows render RED, mirroring the monitor.
+    (from pgrep of the live process). ERROR rows render RED, mirroring the monitor.
     Rows arrive pre-sorted by CONTEXT % descending from gather_context_rows().
 
     KEYED no-remount discipline (mirrors AgentsApp._sync_rows): the liveness
@@ -1672,9 +1672,9 @@ class AgentsApp(App):
 
     def _refresh_context(self, agents: list[Agent]) -> None:
         """Update the Context tab from the SAME gathered agent list (no second
-        tmux/ps sweep) on every refresh tick. All file reads (monitor-state.json,
-        monitor.lock) live in data.py; this only hands prepared rows to the
-        widget."""
+        tmux/ps sweep) on every refresh tick. Reads of monitor-state.json and the
+        monitor-liveness pgrep live in data.py; this only hands prepared rows to
+        the widget."""
         try:
             pane = self.query_one("#context", ContextPane)
         except Exception:

@@ -40,10 +40,11 @@ CTX_DIR = "/tmp/claude-ctx"
 NEEDY_STYLE = "bg=colour52"  # set by ~/.claude/hooks/tmux-attention.sh
 
 # ctx-monitor sidecar files in CTX_DIR (see ~/.claude/tools/ctx-monitor/
-# ctx-monitor.py). monitor-state.json holds per-pane cycle STATE; monitor.lock
-# is the single-instance flock with the holder PID stamped inside.
+# ctx-monitor.py). monitor-state.json holds per-pane cycle STATE. We deliberately
+# do NOT read the monitor.lock file for liveness — macOS reaps it from /tmp after
+# ~3 days and it can hold a stale dead PID, so it lies. monitor_liveness() asks
+# the OS for the actual running process instead (see below).
 MONITOR_STATE_FILE = os.path.join(CTX_DIR, "monitor-state.json")
-MONITOR_LOCK_FILE = os.path.join(CTX_DIR, "monitor.lock")
 
 # Internal monitor STATE identifiers -> human-readable dashboard labels.
 # Mirrors ctx-monitor.py's STATE_LABELS EXACTLY (its ARMED/SAVE_SENT/...).
@@ -187,7 +188,7 @@ class ContextRow:
 
 @dataclass
 class MonitorLiveness:
-    """Liveness of the ctx-monitor sidecar (from monitor.lock's stamped PID)."""
+    """Liveness of the ctx-monitor sidecar (from the actual running process)."""
     alive: bool
     pid: Optional[int]
 
@@ -1243,30 +1244,33 @@ def request_state_reset(sid: str) -> tuple[bool, str]:
 
 
 def monitor_liveness() -> MonitorLiveness:
-    """Read monitor.lock's stamped PID and test it with os.kill(pid, 0).
+    """Report whether the ctx-monitor sidecar is actually running, via pgrep.
 
-    The lock file holds the holder's bare PID (see ctx-monitor's
-    acquire_instance_lock). os.kill(pid, 0) raises ProcessLookupError when the
-    pid is dead and PermissionError when it's alive but not ours (still alive).
-    Missing/empty/garbage lock -> not running.
+    We ask the OS for the live process instead of reading monitor.lock's stamped
+    PID. The lock file is unreliable: macOS reaps it from /tmp after ~3 days, and
+    it can hold a stale dead PID — the same root cause as the duplicate-daemon
+    bug (the cockpit used to "spawn if the lock-PID isn't alive" and double up).
+    `pgrep -f ctx-monitor.py` is process truth: non-empty stdout -> alive (we
+    take the first PID); empty/non-zero/missing-pgrep/timeout/any error -> dead.
     """
     try:
-        with open(MONITOR_LOCK_FILE) as f:
-            raw = f.read().strip()
-    except OSError:
+        proc = subprocess.run(
+            ["pgrep", "-f", "ctx-monitor.py"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return MonitorLiveness(alive=False, pid=None)
+    if proc.returncode != 0:
+        return MonitorLiveness(alive=False, pid=None)
+    pids = proc.stdout.split()
+    if not pids:
         return MonitorLiveness(alive=False, pid=None)
     try:
-        pid = int(raw)
+        pid = int(pids[0])
     except (TypeError, ValueError):
         return MonitorLiveness(alive=False, pid=None)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return MonitorLiveness(alive=False, pid=pid)
-    except PermissionError:
-        return MonitorLiveness(alive=True, pid=pid)
-    except OSError:
-        return MonitorLiveness(alive=False, pid=pid)
     return MonitorLiveness(alive=True, pid=pid)
 
 
