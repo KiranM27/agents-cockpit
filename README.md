@@ -46,6 +46,45 @@ window focus. The cockpit reads everything from tmux and uses one stamped value
 
 4. **This README.**
 
+## ctx-monitor lives here too
+
+`ctx-monitor/` is a companion stdlib-python daemon (no LLM, no deps) that watches
+every tmux pane running Claude Code and, when a session's context crosses a
+threshold, drives an unattended checkpoint cycle: save state → `/compact` →
+reorient → continue. It's independent of the cockpit but shares the same
+`/tmp/claude-ctx` tap that feeds the context %. Details:
+[`ctx-monitor/README.md`](ctx-monitor/README.md) and
+[`ctx-monitor/DESIGN.md`](ctx-monitor/DESIGN.md).
+
+## Install (fresh machine)
+
+The `agents` launcher self-locates, so the repo can live anywhere.
+
+```sh
+# 1. Clone (any location)
+git clone https://github.com/KiranM27/agents-cockpit
+cd agents-cockpit
+
+# 2. Create the isolated venv (only dep: textual)
+/opt/homebrew/bin/python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 3. Put the launchers on PATH
+ln -s "$PWD/agents"         ~/.local/bin/agents
+ln -s "$PWD/agents-classic" ~/.local/bin/agents-classic
+
+# 4. Wire ctx-monitor into Claude (so ~/.claude/tools/ctx-monitor resolves here)
+mkdir -p ~/.claude/tools && ln -s "$PWD/ctx-monitor" ~/.claude/tools/ctx-monitor
+```
+
+5. **Install the statusline tap** so the context % column populates — the block
+   that publishes `/tmp/claude-ctx/<session_id>.json`. See
+   [`ctx-monitor/README.md`](ctx-monitor/README.md#installing-the-statusline-tap).
+6. **The tmux + `~/.claude` glue** the cockpit relies on lives in the
+   [dotfiles repo](https://github.com/KiranM27/dotfiles) and `~/.claude`, not
+   here: the `client-attached` hook that runs `stamp-aerospace-wid.sh` (needed
+   for Enter → Aerospace jump), plus the `/tag` slash command and the attention
+   hook (`tmux-attention.sh`). Follow the dotfiles README to set them up.
+
 ## Launch
 
 ```sh

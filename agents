@@ -13,7 +13,15 @@
 
 set -euo pipefail
 
-HERE="/Users/kiran/Desktop/forge.nosync/agents-cockpit"
+# Self-locate this script's dir, resolving the ~/.local/bin/agents symlink.
+# BSD/macOS has no `readlink -f`, so walk the symlink chain by hand.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
+done
+HERE="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 VENV_PY="${HERE}/.venv/bin/python"
 
 if [ ! -x "$VENV_PY" ]; then
