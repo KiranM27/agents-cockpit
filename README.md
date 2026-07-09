@@ -1,9 +1,16 @@
 # agents cockpit
 
-An fzf picker over your ~20 Claude Code tmux sessions. One row per session:
+A cockpit over your ~20 Claude Code tmux sessions. One row per session:
 an identity dot + name + context %, with sessions that **need attention**
 pushed to the top in red. Press **Enter** to jump to the Ghostty window that
 hosts the selected session.
+
+> **Note:** `agents` is now a Textual TUI; the original fzf picker is preserved
+> as `agents-classic`. Most of the prose below describes the shared design. The
+> difference that matters day-to-day: the **TUI takes each session's name from
+> its Claude title (`/rename`) and color from `/color`**, whereas
+> `agents-classic` reads `@cc_name`/`@cc_color` stamped by the legacy `/tag`
+> command.
 
 ## The core idea: read tmux, jump via Aerospace
 
@@ -35,11 +42,11 @@ window focus. The cockpit reads everything from tmux and uses one stamped value
      `~/.claude/hooks/tmux-attention.sh` when Claude Code wants you. Needy rows
      get a `❗` and go red, sorted to the top.
 
-2. **`/tag <color> <name>`** — a Claude Code slash command
-   (`~/.claude/commands/tag.md`). Run it *inside an agent* to give that session
-   an identity. It stamps `@cc_name` and `@cc_color` on the current pane and
-   renames the tmux session. `<name>` may contain spaces. Valid colors:
-   `red blue green yellow purple orange pink cyan`.
+2. **`/tag <color> <name>`** — a *legacy* slash command
+   (`~/.claude/commands/tag.md`), read only by `agents-classic`. It stamps
+   `@cc_name`/`@cc_color` and renames the tmux session. The current `agents`
+   TUI does **not** read these — it takes its name from the Claude session
+   title (`/rename`) and color from `/color`. Kept for the fzf picker only.
 
 3. **`stamp-aerospace-wid.sh`** + a tmux `client-attached` hook — records which
    Ghostty window hosts each session so Enter can jump to it. See below.
@@ -68,9 +75,10 @@ cd agents-cockpit
 # 2. Create the isolated venv (only dep: textual)
 /opt/homebrew/bin/python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# 3. Put the launchers on PATH
-ln -s "$PWD/agents"         ~/.local/bin/agents
-ln -s "$PWD/agents-classic" ~/.local/bin/agents-classic
+# 3. Put the launchers + the aerospace-stamp hook script on PATH
+ln -s "$PWD/agents"                 ~/.local/bin/agents
+ln -s "$PWD/agents-classic"         ~/.local/bin/agents-classic
+ln -s "$PWD/stamp-aerospace-wid.sh" ~/.local/bin/stamp-aerospace-wid.sh
 
 # 4. Wire ctx-monitor into Claude (so ~/.claude/tools/ctx-monitor resolves here)
 mkdir -p ~/.claude/tools && ln -s "$PWD/ctx-monitor" ~/.claude/tools/ctx-monitor
@@ -82,8 +90,9 @@ mkdir -p ~/.claude/tools && ln -s "$PWD/ctx-monitor" ~/.claude/tools/ctx-monitor
 6. **The tmux + `~/.claude` glue** the cockpit relies on lives in the
    [dotfiles repo](https://github.com/KiranM27/dotfiles) and `~/.claude`, not
    here: the `client-attached` hook that runs `stamp-aerospace-wid.sh` (needed
-   for Enter → Aerospace jump), plus the `/tag` slash command and the attention
-   hook (`tmux-attention.sh`). Follow the dotfiles README to set them up.
+   for Enter → Aerospace jump; the hook invokes it via `~/.local/bin`, so
+   step 3 above is what wires it up), plus the attention hook
+   (`tmux-attention.sh`). Follow the dotfiles README to set them up.
 
 ## Launch
 
@@ -97,14 +106,17 @@ If a session has no window mapping yet, Enter prints a hint to attach it once.
 
 ## Set an identity
 
-Inside any agent session:
+The `agents` TUI reads each session's **name from its Claude session title**
+(what `/rename` sets) and its **color from `/color`** — so just use Claude
+Code's built-ins inside any agent session:
 
 ```
-/tag blue auth-fix
-/tag orange drafting review pass 2
+/rename auth-fix
+/color blue
 ```
 
-This colors the dot, labels the row, and renames the session.
+(`/tag`, which stamps `@cc_name`/`@cc_color`, is the *legacy* path read only by
+`agents-classic`, the fzf original. The TUI ignores it.)
 
 ## Refresh mechanism
 
