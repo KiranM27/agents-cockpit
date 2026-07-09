@@ -94,6 +94,35 @@ After a `--dry-run` session, remove the persisted state before a real run
 
     rm -f /tmp/claude-ctx/monitor-state.json
 
+### Run always-on (launchd)
+
+To keep the monitor running unattended — and relaunch it at every login —
+load the LaunchAgent instead of running it in a terminal:
+
+    launchctl load -w ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
+    # modern: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
+
+The plist (label `sg.lexi.ctx-monitor`) has `RunAtLoad` + `KeepAlive`, so this
+starts the monitor now and relaunches it on every login (and if it ever dies).
+Its `ProgramArguments` run `~/.claude/tools/ctx-monitor/ctx-monitor.py`, which
+resolves through the symlink into this repo — so it **depends on the
+`~/.claude/tools/ctx-monitor` symlink existing** (see the cockpit's
+[Install](../README.md#install-fresh-machine) step 4). stderr is captured to
+`/tmp/claude-ctx/monitor.err`.
+
+This is **opt-in** — skip it if you don't want the monitor always driving compact
+cycles; the foreground `python3 ctx-monitor.py` run above is enough for ad-hoc
+use. To stop / unload:
+
+    launchctl unload ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
+
+The plist itself is **not** in this repo — it ships in the
+**[dotfiles repo](https://github.com/KiranM27/dotfiles)** as the `launchagents`
+stow package (`launchagents/Library/LaunchAgents/sg.lexi.ctx-monitor.plist`), and
+dotfiles' `./index.sh` symlinks it into `~/Library/LaunchAgents/`. Only one
+instance can run regardless (the `.monitor.lock` flock), so the LaunchAgent and a
+stray foreground run won't double up.
+
 ## Dashboard
 
 One row per live pane: `#` (serial), PANE, NAME (the pane's `@cc_name` tmux
