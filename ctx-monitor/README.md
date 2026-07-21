@@ -97,10 +97,16 @@ After a `--dry-run` session, remove the persisted state before a real run
 ### Run always-on (launchd)
 
 To keep the monitor running unattended — and relaunch it at every login —
-load the LaunchAgent instead of running it in a terminal:
+register the LaunchAgent instead of running it in a terminal:
 
-    launchctl load -w ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
-    # modern: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
+    launchctl enable gui/$(id -u)/sg.lexi.ctx-monitor
+
+(`launchctl load -w` is the deprecated spelling — prefer `bootstrap`.) If it
+errors with "already bootstrapped", boot it out first:
+`launchctl bootout gui/$(id -u)/sg.lexi.ctx-monitor`. That bootout-then-bootstrap
+cycle is also how you make launchd pick up an **edited** plist — it caches the
+old one otherwise.
 
 The plist (label `sg.lexi.ctx-monitor`) has `RunAtLoad` + `KeepAlive`, so this
 starts the monitor now and relaunches it on every login (and if it ever dies).
@@ -108,20 +114,43 @@ Its `ProgramArguments` run `~/.claude/tools/ctx-monitor/ctx-monitor.py`, which
 resolves through the symlink into this repo — so it **depends on the
 `~/.claude/tools/ctx-monitor` symlink existing** (see the cockpit's
 [Install](../README.md#install-fresh-machine) step 4). stderr is captured to
-`/tmp/claude-ctx/monitor.err`.
+`~/Library/Logs/ctx-monitor.err`.
 
-This is **opt-in** — skip it if you don't want the monitor always driving compact
-cycles; the foreground `python3 ctx-monitor.py` run above is enough for ad-hoc
-use. To stop / unload:
+> **Why not `/tmp/claude-ctx/monitor.err`?** launchd opens `StandardErrorPath`
+> *before* exec'ing the job and does **not** create intermediate directories.
+> The monitor makes its own state dir, but that runs far too late — and macOS
+> reaps untouched `/tmp` files after ~3 days. So a `/tmp` log path meant launchd
+> could silently fail to spawn the job at login. `~/Library/Logs` always exists
+> and is never reaped.
 
-    launchctl unload ~/Library/LaunchAgents/sg.lexi.ctx-monitor.plist
+To stop:
+
+    launchctl bootout gui/$(id -u)/sg.lexi.ctx-monitor
+
+The foreground `python3 ctx-monitor.py` run above is still fine for ad-hoc use.
+Only one instance can run regardless (the `.monitor.lock` flock), so the
+LaunchAgent and a stray foreground run won't double up.
 
 The plist itself is **not** in this repo — it ships in the
 **[dotfiles repo](https://github.com/KiranM27/dotfiles)** as the `launchagents`
-stow package (`launchagents/Library/LaunchAgents/sg.lexi.ctx-monitor.plist`), and
-dotfiles' `./index.sh` symlinks it into `~/Library/LaunchAgents/`. Only one
-instance can run regardless (the `.monitor.lock` flock), so the LaunchAgent and a
-stray foreground run won't double up.
+stow package (`launchagents/Library/LaunchAgents/sg.lexi.ctx-monitor.plist`).
+dotfiles' `./index.sh` both symlinks it into `~/Library/LaunchAgents/` **and**
+registers it via `scripts/load_launchagents.sh`. Edit the plist at its real path
+in the dotfiles repo, not through the symlink.
+
+#### Not running? Diagnose with `launchctl list`
+
+    launchctl list | grep ctx-monitor
+
+- **No output** — launchd has never heard of the job: the plist is *stowed but
+  not registered*. Bootstrap it (above). The symlink existing tells you nothing.
+- **PID + `0`** — healthy.
+- **`-` for PID, or non-zero exit** — *registered but crashing*. Read
+  `~/Library/Logs/ctx-monitor.err`; usually the `~/.claude/tools/ctx-monitor`
+  symlink does not resolve.
+
+A stale `.monitor.lock` is never the cause — the lock is an `flock`, released
+automatically on process death. Do not delete it to "fix" a startup problem.
 
 ## Dashboard
 
